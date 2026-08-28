@@ -329,6 +329,45 @@ class WakeWordStudentModel(nn.Module):
             
         return norm_embed
 
+def load_speech_dataset(mswc_split: str, local_data_dir: str = None):
+    """
+    Robust Dataset Loader:
+    1. Attempts MLCommons/ml_spoken_words (with trust_remote_code=True)
+    2. Falls back to Parquet-native 'google/speech_commands' (works on datasets >= 3.0.0)
+    3. Falls back to local directory 'audiofolder'
+    """
+    # 1. Try MLCommons MSWC
+    try:
+        print(f"Attempting to load MSWC English dataset ({mswc_split})...")
+        ds = load_dataset("MLCommons/ml_spoken_words", "en", split=mswc_split, trust_remote_code=True)
+        print("✅ Loaded MSWC dataset successfully!")
+        return ds
+    except Exception as e:
+        print(f"⚠️ MLCommons script failed ({e}). Switching to Parquet-native Google Speech Commands on HuggingFace...")
+
+    # 2. Try Hugging Face google/speech_commands (Parquet format - guaranteed to work on datasets >= 3.0.0)
+    try:
+        split_name = mswc_split if "%" in mswc_split else "train"
+        ds = load_dataset("google/speech_commands", "v0.02", split=split_name)
+        print(f"✅ Loaded 'google/speech_commands' (v0.02, split={split_name}) via Parquet!")
+        return ds
+    except Exception as e:
+        print(f"⚠️ HuggingFace Speech Commands load failed ({e}). Checking local directory...")
+
+    # 3. Try Local Kaggle directory
+    candidates = [
+        local_data_dir,
+        "/kaggle/input/datasets/neehakurelli/google-speech-commands",
+        "/kaggle/input/google-speech-commands",
+        "/kaggle/input/speech-commands-v0-02"
+    ]
+    for c in candidates:
+        if c and os.path.exists(c):
+            print(f"📁 Loading local audio dataset from: {c}")
+            return load_dataset("audiofolder", data_dir=c, split="train")
+
+    raise RuntimeError("Could not load any speech dataset. Check internet access or attached datasets.")
+
 # =====================================================================
 # 4. DATASET & FRONTEND
 # =====================================================================
@@ -348,7 +387,21 @@ class MSWCTrainingDataset(Dataset):
         item = self.dataset[idx]
         raw_audio = item["audio"]["array"]
         in_sr = item["audio"]["sampling_rate"]
-        word = str(item.get("word", "unknown"))
+        
+        # Resolve word label safely across MSWC, Google Speech Commands, and AudioFolder
+        word = item.get("word")
+        if not word and "label" in item:
+            val = item["label"]
+            if isinstance(val, str):
+                word = val
+            elif hasattr(self.dataset, "features") and "label" in self.dataset.features:
+                try:
+                    word = self.dataset.features["label"].int2str(val)
+                except Exception:
+                    word = str(val)
+            else:
+                word = str(val)
+        word = str(word) if word else "unknown"
 
         wav_t = torch.tensor(raw_audio, dtype=torch.float32)
         if in_sr != SR:
@@ -493,8 +546,7 @@ def run_training(
     print(f"  • Early Stopping:        {early_stopping_patience} epochs\n")
     
     # 1. Load Datasets
-    print(f"Loading MSWC English Dataset ({mswc_split})...")
-    ds = load_dataset("MLCommons/ml_spoken_words", "en", split=mswc_split)
+    ds = load_speech_dataset(mswc_split)
     noise_bank = load_background_noise_bank(noise_dir)
     
     train_size = int(0.9 * len(ds))
