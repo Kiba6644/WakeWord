@@ -249,14 +249,21 @@ class MultiHeadAttentionPooling(nn.Module):
         self.out_proj = nn.Linear(num_heads * in_dim, embed_dim)
         self.layer_norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         b, t, d = x.shape
         keys = self.key_proj(x)
         vals = self.val_proj(x)
         
         q = self.query_tokens.unsqueeze(0).expand(b, -1, -1)
         scores = torch.bmm(q, keys.transpose(1, 2)) / (d ** 0.5)
+        
+        if mask is not None:
+            # mask: (B, T) boolean. True means valid frame.
+            mask = mask.unsqueeze(1).expand(-1, self.num_heads, -1)
+            scores = scores.masked_fill(~mask, float('-inf'))
+            
         attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = torch.nan_to_num(attn_weights) # safe fallback if all masked
         
         pooled = torch.bmm(attn_weights, vals)
         pooled = pooled.reshape(b, -1)
@@ -264,7 +271,7 @@ class MultiHeadAttentionPooling(nn.Module):
         out = self.layer_norm(out)
         return out
 
-class WakeWordStudentModel(nn.Module):
+class WakeWordModel(nn.Module):
     def __init__(self, channels=STAGE2_CHANNELS, temporal_head="attention", embed_dim=EMBED_DIM):
         super().__init__()
         self.encoder = DSCNNEncoder(in_channels=1, channels=channels)
@@ -304,11 +311,18 @@ class WakeWordStudentModel(nn.Module):
         feat = feat.transpose(1, 2)
         return feat
 
-    def forward(self, x, return_distill=False, return_ctc=False):
+    def forward(self, x, mask=None, return_distill=False, return_ctc=False):
         feat = self.extract_time_features(x)
         
         if self.temporal_head_type == "attention":
-            embed = self.temporal(feat)
+            if mask is not None:
+                # Downsample mask to match CNN time dimension (stride=2 in first layer)
+                mask_float = mask.float().unsqueeze(1)
+                mask_down = F.adaptive_max_pool1d(mask_float, output_size=feat.size(1)).squeeze(1)
+                bool_mask = mask_down > 0.5
+            else:
+                bool_mask = None
+            embed = self.temporal(feat, mask=bool_mask)
         elif self.temporal_head_type == "gru":
             out, _ = self.gru(feat)
             embed = out[:, -1, :]
@@ -329,44 +343,21 @@ class WakeWordStudentModel(nn.Module):
             
         return norm_embed
 
-def load_speech_dataset(mswc_split: str, local_data_dir: str = None):
+def load_speech_dataset(mswc_split: str):
     """
-    Robust Dataset Loader:
-    1. Attempts MLCommons/ml_spoken_words (with trust_remote_code=True)
-    2. Falls back to Parquet-native 'google/speech_commands' (works on datasets >= 3.0.0)
-    3. Falls back to local directory 'audiofolder'
+    Loads MSWC (Multilingual Spoken Words Corpus) English dataset.
+    Requires datasets < 3.0.0 for legacy dataset script compatibility.
     """
-    # 1. Try MLCommons MSWC
+    print(f"Loading primary MSWC English dataset ({mswc_split})...")
     try:
-        print(f"Attempting to load MSWC English dataset ({mswc_split})...")
-        ds = load_dataset("MLCommons/ml_spoken_words", "en", split=mswc_split, trust_remote_code=True)
-        print("✅ Loaded MSWC dataset successfully!")
+        ds = load_dataset("MLCommons/ml_spoken_words", "en_opus", split=mswc_split, trust_remote_code=True)
+        print(f"✅ Successfully loaded MSWC dataset ({len(ds)} audio samples)!")
         return ds
     except Exception as e:
-        print(f"⚠️ MLCommons script failed ({e}). Switching to Parquet-native Google Speech Commands on HuggingFace...")
-
-    # 2. Try Hugging Face google/speech_commands (Parquet format - guaranteed to work on datasets >= 3.0.0)
-    try:
-        split_name = mswc_split if "%" in mswc_split else "train"
-        ds = load_dataset("google/speech_commands", "v0.02", split=split_name)
-        print(f"✅ Loaded 'google/speech_commands' (v0.02, split={split_name}) via Parquet!")
-        return ds
-    except Exception as e:
-        print(f"⚠️ HuggingFace Speech Commands load failed ({e}). Checking local directory...")
-
-    # 3. Try Local Kaggle directory
-    candidates = [
-        local_data_dir,
-        "/kaggle/input/datasets/neehakurelli/google-speech-commands",
-        "/kaggle/input/google-speech-commands",
-        "/kaggle/input/speech-commands-v0-02"
-    ]
-    for c in candidates:
-        if c and os.path.exists(c):
-            print(f"📁 Loading local audio dataset from: {c}")
-            return load_dataset("audiofolder", data_dir=c, split="train")
-
-    raise RuntimeError("Could not load any speech dataset. Check internet access or attached datasets.")
+        raise RuntimeError(
+            f"Failed to load MSWC dataset: {e}\n"
+            f"Fix: Ensure you have 'datasets < 3.0.0' installed (e.g. `pip install \"datasets<3.0.0\"`) and Internet access is ON."
+        )
 
 # =====================================================================
 # 4. DATASET & FRONTEND
@@ -564,7 +555,7 @@ def run_training(
     print(f"Dataset Ready: {len(train_ds)} train clips, {len(val_ds)} val clips.")
     
     # 2. Load Student and Teachers
-    student = WakeWordStudentModel().to(device)
+    student = WakeWordModel().to(device)
     print(f"Student Model Parameters: {sum(p.numel() for p in student.parameters() if p.requires_grad):,}")
     
     print(f"Loading WavLM Teacher ({wavlm_model})...")
@@ -573,6 +564,8 @@ def run_training(
     for p in wavlm.parameters(): p.requires_grad = False
     
     print(f"Loading Whisper Teacher ({whisper_model})...")
+    from transformers import WhisperFeatureExtractor
+    whisper_extractor = WhisperFeatureExtractor.from_pretrained(whisper_model)
     whisper = WhisperModel.from_pretrained(whisper_model).encoder.to(device)
     whisper.eval()
     for p in whisper.parameters(): p.requires_grad = False
@@ -609,14 +602,25 @@ def run_training(
             wavs_np = np.stack(batch["wavs"], axis=0)
             wavs_t = torch.tensor(wavs_np, dtype=torch.float32, device=device)
             
+            # Compute energy mask to ignore silence padding (-9.2 is approx log(1e-4))
+            energy = mels.mean(dim=-1).squeeze(1) # (B, T)
+            attention_mask = energy > -10.0
+            
             with torch.no_grad():
+                # WavLM target
                 wavlm_out = wavlm(wavs_t).last_hidden_state
                 wavlm_target = wavlm_out.mean(dim=1)
-                whisper_target = torch.randn(len(batch["wavs"]), WHISPER_EMBED_DIM, device=device)
+                
+                # Whisper target (REAL, not random)
+                whisper_inputs = whisper_extractor(
+                    [w for w in wavs_np], sampling_rate=SR, return_tensors="pt"
+                ).input_features.to(device)
+                whisper_out = whisper(whisper_inputs).last_hidden_state
+                whisper_target = whisper_out.mean(dim=1)
             
             with autocast():
-                norm_embed, (s_wavlm_proj, s_whisper_proj), ctc_logits = student(mels, return_distill=True)
-                trunc_embed = student(trunc_mels)
+                norm_embed, (s_wavlm_proj, s_whisper_proj), ctc_logits = student(mels, mask=attention_mask, return_distill=True)
+                trunc_embed = student(trunc_mels, mask=attention_mask)
                 
                 loss_wavlm = cosine_distillation_loss(s_wavlm_proj, wavlm_target)
                 loss_whisper = cosine_distillation_loss(s_whisper_proj, whisper_target)
@@ -648,27 +652,40 @@ def run_training(
             total_epoch_loss += loss.item()
             
             if step % 25 == 0:
-                print(f"Step {step:03d} | Loss: {loss.item():.4f} | Distill: {loss_wavlm.item():.3f} | TierC: {loss_tier_c.item():.3f} | Proto: {loss_proto.item():.3f}")
+                print(f"Step {step:03d} | Loss: {loss.item():.4f} | Distill: {(loss_wavlm+loss_whisper).item():.3f} | TierC: {loss_tier_c.item():.3f} | Proto: {loss_proto.item():.3f}")
                 
         scheduler.step()
         avg_train_loss = total_epoch_loss / len(train_loader)
         
         # Validation & Early Stopping
         student.eval()
-        val_loss = 0.0
+        val_trunc_loss = 0.0
+        val_proto_loss = 0.0
+        val_batches = 0
+        
         with torch.no_grad():
             for v_batch in val_loader:
                 v_mels = v_batch["mels"].to(device)
                 v_trunc = v_batch["trunc_mels"].to(device)
-                v_embed = student(v_mels)
-                v_trunc_embed = student(v_trunc)
-                val_loss += truncation_margin_loss(v_embed, v_trunc_embed).item()
-        val_loss /= len(val_loader)
+                v_energy = v_mels.mean(dim=-1).squeeze(1)
+                v_mask = v_energy > -10.0
+                
+                v_embed = student(v_mels, mask=v_mask)
+                v_trunc_embed = student(v_trunc, mask=v_mask)
+                
+                val_trunc_loss += truncation_margin_loss(v_embed, v_trunc_embed).item()
+                p_loss, _ = compute_prototypical_loss(v_embed, v_batch["words"])
+                val_proto_loss += p_loss.item()
+                val_batches += 1
+                
+        val_trunc_loss /= val_batches
+        val_proto_loss /= val_batches
+        val_combined = val_trunc_loss + val_proto_loss # We want to minimize both
         
-        print(f"Epoch {epoch+1} Done | Train Loss: {avg_train_loss:.4f} | Val Truncation Distance: {val_loss:.4f}")
+        print(f"Epoch {epoch+1} Done | Train Loss: {avg_train_loss:.4f} | Val Trunc: {val_trunc_loss:.4f} | Val Proto: {val_proto_loss:.4f}")
         
-        if val_loss < best_val_loss:
-            best_val_loss = val_loss
+        if val_combined < best_val_loss:
+            best_val_loss = val_combined
             patience = 0
             torch.save({
                 'epoch': epoch,

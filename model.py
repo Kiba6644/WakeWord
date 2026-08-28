@@ -65,20 +65,28 @@ class MultiHeadAttentionPooling(nn.Module):
     def __init__(self, in_dim, embed_dim, num_heads=NUM_ATTENTION_HEADS):
         super().__init__()
         self.num_heads = num_heads
-        self.query_tokens = nn.Parameter(torch.randn(num_heads, in_dim))
+        self.query_tokens = nn.Parameter(torch.empty(num_heads, in_dim))
+        nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
+        
         self.key_proj = nn.Linear(in_dim, in_dim, bias=False)
         self.val_proj = nn.Linear(in_dim, in_dim, bias=False)
         self.out_proj = nn.Linear(num_heads * in_dim, embed_dim)
         self.layer_norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, x):
+    def forward(self, x, mask=None):
         b, t, d = x.shape
         keys = self.key_proj(x)
         vals = self.val_proj(x)
         
         q = self.query_tokens.unsqueeze(0).expand(b, -1, -1)
         scores = torch.bmm(q, keys.transpose(1, 2)) / (d ** 0.5)
+        
+        if mask is not None:
+            mask = mask.unsqueeze(1).expand(-1, self.num_heads, -1)
+            scores = scores.masked_fill(~mask, float('-inf'))
+            
         attn_weights = F.softmax(scores, dim=-1)
+        attn_weights = torch.nan_to_num(attn_weights)
         
         pooled = torch.bmm(attn_weights, vals)
         pooled = pooled.reshape(b, -1)
@@ -87,50 +95,34 @@ class MultiHeadAttentionPooling(nn.Module):
         return out
 
 class WakeWordModel(nn.Module):
-    """
-    SOTA Wake Word Engine Student Model:
-    - Dual Distillation Projections: WavLM-Large (1024D) + Whisper-Base (512D)
-    - Phoneme CTC Frame Classification Head (42 classes)
-    - Temporal Multi-Head Attention Head (128D)
-    """
-    def __init__(self, channels=STAGE2_CHANNELS, temporal_head="attention", embed_dim=EMBED_DIM,
-                 wavlm_embed_dim=WAVLM_EMBED_DIM, whisper_embed_dim=WHISPER_EMBED_DIM,
-                 num_phonemes=NUM_PHONEMES):
+    def __init__(self, channels=STAGE2_CHANNELS, temporal_head="attention", embed_dim=EMBED_DIM):
         super().__init__()
         self.encoder = DSCNNEncoder(in_channels=1, channels=channels)
         self.temporal_head_type = temporal_head
-        self.channels = channels
-        self.embed_dim = embed_dim
-        
         self.spatial_pool = nn.AdaptiveAvgPool2d((None, 1))
         
         if temporal_head == "attention":
             self.temporal = MultiHeadAttentionPooling(channels[-1], embed_dim)
         elif temporal_head == "gru":
             self.gru = nn.GRU(channels[-1], embed_dim, batch_first=True)
-        elif temporal_head == "pool":
+        else:
             self.pool = nn.AdaptiveAvgPool1d(1)
             self.fc = nn.Linear(channels[-1], embed_dim)
-        else:
-            raise ValueError(f"Unknown temporal_head: {temporal_head}")
 
-        # Dual Distillation Heads (Used during multi-task training)
         self.distill_wavlm_proj = nn.Sequential(
             nn.Linear(embed_dim, 512),
             nn.SiLU(inplace=True),
-            nn.Linear(512, wavlm_embed_dim)
+            nn.Linear(512, WAVLM_EMBED_DIM)
         )
         self.distill_whisper_proj = nn.Sequential(
             nn.Linear(embed_dim, 256),
             nn.SiLU(inplace=True),
-            nn.Linear(256, whisper_embed_dim)
+            nn.Linear(256, WHISPER_EMBED_DIM)
         )
-
-        # SOTA Phoneme CTC Prediction Head
         self.ctc_head = nn.Sequential(
             nn.Linear(channels[-1], channels[-1] // 2),
             nn.SiLU(inplace=True),
-            nn.Linear(channels[-1] // 2, num_phonemes),
+            nn.Linear(channels[-1] // 2, NUM_PHONEMES),
             nn.LogSoftmax(dim=-1)
         )
 
@@ -139,24 +131,28 @@ class WakeWordModel(nn.Module):
             x = x.unsqueeze(1)
         feat = self.encoder(x)
         feat = self.spatial_pool(feat).squeeze(-1)
-        feat = feat.transpose(1, 2) # (batch, time, channels)
+        feat = feat.transpose(1, 2)
         return feat
 
-    def forward(self, x, return_distill=False, return_ctc=False):
+    def forward(self, x, mask=None, return_distill=False, return_ctc=False):
         feat = self.extract_time_features(x)
         
         if self.temporal_head_type == "attention":
-            embed = self.temporal(feat)
+            if mask is not None:
+                mask_float = mask.float().unsqueeze(1)
+                mask_down = F.adaptive_max_pool1d(mask_float, output_size=feat.size(1)).squeeze(1)
+                bool_mask = mask_down > 0.5
+            else:
+                bool_mask = None
+            embed = self.temporal(feat, mask=bool_mask)
         elif self.temporal_head_type == "gru":
-            output, _ = self.gru(feat)
-            embed = output[:, -1, :]
-        else: # pool
-            feat_t = feat.transpose(1, 2)
-            pooled = self.pool(feat_t).squeeze(-1)
+            out, _ = self.gru(feat)
+            embed = out[:, -1, :]
+        else:
+            pooled = self.pool(feat.transpose(1, 2)).squeeze(-1)
             embed = self.fc(pooled)
             
         norm_embed = F.normalize(embed, p=2, dim=-1)
-        
         ctc_logits = self.ctc_head(feat) if (return_ctc or return_distill) else None
         
         if return_distill:

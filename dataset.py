@@ -101,7 +101,7 @@ def get_dataloaders(batch_size=BATCH_SIZE, num_workers=4):
     try:
         from config import MSWC_SPLIT
         print(f"Loading MSWC dataset split ({MSWC_SPLIT})...")
-        ds = load_dataset("MLCommons/ml_spoken_words", "en", split=MSWC_SPLIT)
+        ds = load_dataset("MLCommons/ml_spoken_words", "en_opus", split=MSWC_SPLIT, trust_remote_code=True)
     except Exception as e:
         print(f"Failed to load online dataset: {e}. Falling back to local/dummy loader.")
         return None, None
