@@ -97,38 +97,25 @@ python training.py
 
 ---
 
-## 🎙️ Inference & Custom Enrollment
+## 🎙️ Live Microphone Streaming (Non-Stop Real-Time Detection)
 
-```python
-from inference import WakeWordCascade
-import soundfile as sf
-import numpy as np
+Once you download your trained `sota_wakeword_model_int8.onnx` from Kaggle and place it in `./output/`:
 
-# 1. Initialize SOTA Two-Stage Cascade
-cascade = WakeWordCascade(
-    stage1_path="", 
-    stage2_path="./output/sota_wakeword_model_int8.onnx",
-    threshold1=0.60,
-    threshold2=0.82,
-    suffix_threshold=0.65
-)
+```bash
+# Install audio I/O dependency
+pip install sounddevice soundfile
 
-# 2. Enroll with 3-5 real voice clips (Record "Hey Karthika" into mic)
-clip1, _ = sf.read("my_recordings/clip1.wav")
-clip2, _ = sf.read("my_recordings/clip2.wav")
-clip3, _ = sf.read("my_recordings/clip3.wav")
+# Run live stream for your custom phrase
+python live_stream.py "Hey Karthika"
+```
 
-cascade.enroll([clip1, clip2, clip3], phrase="Hey Karthika", sr=16000)
-print("✅ Enrolled! Generated Minimal Pairs:", cascade.minimal_pair_negatives)
+1. **First-time Enrollment:** Prompts you to speak *"Hey Karthika"* 3 times into your microphone and saves your template to `wakeword_profile.json`.
+2. **Continuous Live Stream:** Listens on your microphone continuously and renders a real-time probability meter in your terminal:
+```text
+[ ████████░░░░░░░░░░ ]  42.5%  (Listening...)
+[ ████████████░░░░░░ ]  68.1%  (Matching...)
 
-# 3. Process Live Audio Stream
-dummy_feat = np.random.randn(1, 1, 100, 40).astype(np.float32)
-triggered, metrics = cascade.verify_utterance(dummy_feat, duration_sec=1.2, ctc_suffix_prob=0.95)
-
-if triggered:
-    print("🚨 WAKE WORD TRIGGERED!")
-else:
-    print("❌ Rejected:", metrics.get("rejection_reason", "Below Threshold"))
+🚨 [ ████████████████████ ] 98.4% -> WAKE WORD DETECTED: 'Hey Karthika'! 🚀
 ```
 
 ---
