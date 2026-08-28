@@ -340,12 +340,44 @@ class WakeWordStudentModel(nn.Module):
             
         return norm_embed
 
+def load_background_noise_bank():
+    """Finds and loads background noise files from Kaggle input datasets or local paths."""
+    candidates = [
+        "/kaggle/input/datasets/neehakurelli/google-speech-commands/_background_noise_",
+        "/kaggle/input/datasets/neehakurelli/google-speech-commands",
+        "/kaggle/input/google-speech-commands/_background_noise_",
+        "/kaggle/input/speech-commands-v0-02/_background_noise_",
+        "./data/_background_noise_"
+    ]
+    noise_clips = []
+    for c in candidates:
+        if os.path.exists(c):
+            for root, _, files in os.walk(c):
+                for f in files:
+                    if f.endswith(".wav") and not f.startswith("."):
+                        p = os.path.join(root, f)
+                        try:
+                            w, in_sr = torchaudio.load(p)
+                            if w.shape[0] > 1:
+                                w = w.mean(dim=0, keepdim=True)
+                            if in_sr != SR:
+                                w = torchaudio.functional.resample(w, in_sr, SR)
+                            noise_clips.append(w.squeeze(0).numpy())
+                        except Exception:
+                            pass
+            if noise_clips:
+                print(f"🔊 Successfully loaded {len(noise_clips)} background noise audio files from: {c}")
+                return noise_clips
+    print("ℹ️ No background noise directory found. Using synthetic jitter/noise augmentation.")
+    return []
+
 # =====================================================================
 # 4. DATASET & ON-THE-FLY FRONTEND
 # =====================================================================
 class MSWCTrainingDataset(Dataset):
-    def __init__(self, hf_dataset, target_sec=1.2):
+    def __init__(self, hf_dataset, noise_clips=None, target_sec=1.2):
         self.dataset = hf_dataset
+        self.noise_clips = noise_clips or []
         self.target_samples = int(target_sec * SR)
         self.mel_transform = T.MelSpectrogram(
             sample_rate=SR, n_fft=N_FFT, hop_length=HOP_LENGTH, n_mels=N_MELS, power=2.0
@@ -367,10 +399,25 @@ class MSWCTrainingDataset(Dataset):
             
         wav = wav_t.numpy()
 
-        # Dynamic Tempo Augmentation
+        # 1. Dynamic Tempo Augmentation
         if random.random() < 0.5:
             rate = random.choice(TEMPO_AUG_FACTORS)
             wav = time_stretch_audio(wav, rate, SR)
+
+        # 2. Dynamic Real Background Noise Mixing (Speech Commands)
+        if self.noise_clips and random.random() < 0.6:
+            noise = random.choice(self.noise_clips)
+            if len(noise) > len(wav):
+                start = random.randint(0, len(noise) - len(wav))
+                noise_seg = noise[start:start + len(wav)]
+            else:
+                noise_seg = np.pad(noise, (0, len(wav) - len(noise)), mode='wrap')
+                
+            snr = random.uniform(5.0, 20.0)
+            sig_power = np.sum(wav**2) + 1e-8
+            noise_power = np.sum(noise_seg**2) + 1e-8
+            scale = np.sqrt(sig_power / (noise_power * (10**(snr / 10.0))))
+            wav = wav + noise_seg * scale
 
         # Pad or trim to fixed length
         wav = pad_or_trim(wav, self.target_samples)
@@ -487,20 +534,21 @@ def run_training():
     print(f"🚀 Starting SOTA Wake Word Training on: {device}")
     print(f"=======================================================\n")
     
-    # 1. Load Dataset
+    # 1. Load Dataset & Background Noise
     print(f"Loading MSWC English Split ({MSWC_SPLIT})...")
     ds = load_dataset("MLCommons/ml_spoken_words", "en", split=MSWC_SPLIT)
+    noise_bank = load_background_noise_bank()
     
     train_size = int(0.9 * len(ds))
     val_size = len(ds) - train_size
     train_ds, val_ds = torch.utils.data.random_split(ds, [train_size, val_size])
     
     train_loader = DataLoader(
-        MSWCTrainingDataset(train_ds), batch_size=BATCH_SIZE, shuffle=True,
+        MSWCTrainingDataset(train_ds, noise_clips=noise_bank), batch_size=BATCH_SIZE, shuffle=True,
         collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=True
     )
     val_loader = DataLoader(
-        MSWCTrainingDataset(val_ds), batch_size=BATCH_SIZE, shuffle=False,
+        MSWCTrainingDataset(val_ds, noise_clips=noise_bank), batch_size=BATCH_SIZE, shuffle=False,
         collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=True
     )
     print(f"Dataset Loaded: {len(train_ds)} train samples, {len(val_ds)} val samples.")
