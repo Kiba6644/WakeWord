@@ -71,9 +71,17 @@ WAVLM_DISTILL_WEIGHT = 0.4
 WHISPER_DISTILL_WEIGHT = 0.3
 CTC_LOSS_WEIGHT = 0.3
 
-# Teachers
-WAVLM_TEACHER_MODEL = "microsoft/wavlm-large"
-WHISPER_TEACHER_MODEL = "openai/whisper-base"
+# Teacher Model Identifiers & Local Kaggle Fallbacks
+def resolve_model_path(model_name_or_id, kaggle_subpath):
+    """Checks /kaggle/input/ for local offline weights first, else falls back to HuggingFace ID."""
+    kaggle_candidate = os.path.join("/kaggle/input", kaggle_subpath)
+    if os.path.exists(kaggle_candidate):
+        print(f"📁 Found local model weights at: {kaggle_candidate}")
+        return kaggle_candidate
+    return model_name_or_id
+
+WAVLM_TEACHER_MODEL = resolve_model_path("microsoft/wavlm-large", "wavlm-large")
+WHISPER_TEACHER_MODEL = resolve_model_path("openai/whisper-base", "whisper-base")
 WAVLM_EMBED_DIM = 1024
 WHISPER_EMBED_DIM = 512
 
