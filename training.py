@@ -12,8 +12,10 @@ Architecture:
 import os
 import sys
 import math
+import glob
 import random
 import re
+import argparse
 import logging
 from collections import defaultdict
 
@@ -23,7 +25,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 import torchaudio.transforms as T
-from torch.utils.data import Dataset, DataLoader, DistributedSampler
+from torch.utils.data import Dataset, DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import LambdaLR
 
@@ -48,7 +50,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # =====================================================================
-# 1. HYPERPARAMETERS & CONFIGURATION
+# 1. AUDIO & ARCHITECTURE CONSTANTS
 # =====================================================================
 SR = 16000
 N_MELS = 40
@@ -71,38 +73,13 @@ WAVLM_DISTILL_WEIGHT = 0.4
 WHISPER_DISTILL_WEIGHT = 0.3
 CTC_LOSS_WEIGHT = 0.3
 
-# Teacher Model Identifiers & Local Kaggle Fallbacks
-def resolve_model_path(model_name_or_id, kaggle_subpath):
-    """Checks /kaggle/input/ for local offline weights first, else falls back to HuggingFace ID."""
-    kaggle_candidate = os.path.join("/kaggle/input", kaggle_subpath)
-    if os.path.exists(kaggle_candidate):
-        print(f"📁 Found local model weights at: {kaggle_candidate}")
-        return kaggle_candidate
-    return model_name_or_id
-
-WAVLM_TEACHER_MODEL = resolve_model_path("microsoft/wavlm-large", "wavlm-large")
-WHISPER_TEACHER_MODEL = resolve_model_path("openai/whisper-base", "whisper-base")
 WAVLM_EMBED_DIM = 1024
 WHISPER_EMBED_DIM = 512
 
-# Training Dynamics
 TEMPO_AUG_FACTORS = (0.85, 1.0, 1.15, 1.25)
-MSWC_SPLIT = "train[:15%]"  # ~75,000 clips for optimal balance
-EPOCHS = 50
-PRETRAIN_EPOCHS = 5
-EARLY_STOPPING_PATIENCE = 5
-LEARNING_RATE = 5e-4
-WEIGHT_DECAY = 1e-4
 WARMUP_EPOCHS = 5
 MIN_LR = 1e-5
 GRAD_CLIP_NORM = 1.0
-
-# Batch sizing: 256 per GPU on T4 (16GB), automatically lower on smaller GPUs
-_vram = torch.cuda.get_device_properties(0).total_memory / (1024**3) if torch.cuda.is_available() else 0
-BATCH_SIZE = 16 if (torch.cuda.is_available() and _vram <= 6) else 128
-
-OUTPUT_DIR = "./output"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 # Standard CMU-style Phoneme Index Mapping
 PHONEME_MAP = {
@@ -180,8 +157,30 @@ def word_to_phoneme_tokens(word: str) -> list[int]:
             i += 1
     return tokens if tokens else [PHONEME_MAP['<UNK>']]
 
+def load_background_noise_bank(noise_dir: str) -> list[np.ndarray]:
+    """Directly loads background noise audio files from the specified hardcoded directory."""
+    if not noise_dir or not os.path.exists(noise_dir):
+        print(f"ℹ️ Background noise directory '{noise_dir}' not found. Using synthetic noise augmentation.")
+        return []
+        
+    wav_files = glob.glob(os.path.join(noise_dir, "*.wav"))
+    noise_clips = []
+    for p in wav_files:
+        try:
+            w, in_sr = torchaudio.load(p)
+            if w.shape[0] > 1:
+                w = w.mean(dim=0, keepdim=True)
+            if in_sr != SR:
+                w = torchaudio.functional.resample(w, in_sr, SR)
+            noise_clips.append(w.squeeze(0).numpy())
+        except Exception:
+            pass
+            
+    print(f"🔊 Loaded {len(noise_clips)} background noise files directly from: {noise_dir}")
+    return noise_clips
+
 # =====================================================================
-# 3. STUDENT MODEL ARCHITECTURE (AUDITED & ACCURACY-HARDENED)
+# 3. STUDENT MODEL ARCHITECTURE
 # =====================================================================
 class SqueezeExcitation(nn.Module):
     def __init__(self, channels, reduction=4):
@@ -239,12 +238,6 @@ class DSCNNEncoder(nn.Module):
         return x
 
 class MultiHeadAttentionPooling(nn.Module):
-    """
-    SOTA Multi-Head Attention Pooling:
-    - Learns multi-phoneme query vectors to attend over acoustic time frames.
-    - Zero entropy explosion: query tokens initialized with proper std (0.02).
-    - Energy-masked softmax prevents attention dilution on silence frames.
-    """
     def __init__(self, in_dim, embed_dim, num_heads=NUM_ATTENTION_HEADS):
         super().__init__()
         self.num_heads = num_heads
@@ -257,16 +250,15 @@ class MultiHeadAttentionPooling(nn.Module):
         self.layer_norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x):
-        # x: (batch, time, in_dim)
         b, t, d = x.shape
         keys = self.key_proj(x)
         vals = self.val_proj(x)
         
-        q = self.query_tokens.unsqueeze(0).expand(b, -1, -1) # (batch, num_heads, in_dim)
-        scores = torch.bmm(q, keys.transpose(1, 2)) / (d ** 0.5) # (batch, num_heads, time)
+        q = self.query_tokens.unsqueeze(0).expand(b, -1, -1)
+        scores = torch.bmm(q, keys.transpose(1, 2)) / (d ** 0.5)
         attn_weights = F.softmax(scores, dim=-1)
         
-        pooled = torch.bmm(attn_weights, vals) # (batch, num_heads, in_dim)
+        pooled = torch.bmm(attn_weights, vals)
         pooled = pooled.reshape(b, -1)
         out = self.out_proj(pooled)
         out = self.layer_norm(out)
@@ -287,7 +279,6 @@ class WakeWordStudentModel(nn.Module):
             self.pool = nn.AdaptiveAvgPool1d(1)
             self.fc = nn.Linear(channels[-1], embed_dim)
 
-        # Distillation Projections (Matching Teacher Embedding Spaces)
         self.distill_wavlm_proj = nn.Sequential(
             nn.Linear(embed_dim, 512),
             nn.SiLU(inplace=True),
@@ -298,8 +289,6 @@ class WakeWordStudentModel(nn.Module):
             nn.SiLU(inplace=True),
             nn.Linear(256, WHISPER_EMBED_DIM)
         )
-
-        # Auxiliary Phoneme CTC Head
         self.ctc_head = nn.Sequential(
             nn.Linear(channels[-1], channels[-1] // 2),
             nn.SiLU(inplace=True),
@@ -311,8 +300,8 @@ class WakeWordStudentModel(nn.Module):
         if x.ndim == 3:
             x = x.unsqueeze(1)
         feat = self.encoder(x)
-        feat = self.spatial_pool(feat).squeeze(-1) # (B, C, T)
-        feat = feat.transpose(1, 2)                # (B, T, C)
+        feat = self.spatial_pool(feat).squeeze(-1)
+        feat = feat.transpose(1, 2)
         return feat
 
     def forward(self, x, return_distill=False, return_ctc=False):
@@ -340,39 +329,8 @@ class WakeWordStudentModel(nn.Module):
             
         return norm_embed
 
-def load_background_noise_bank():
-    """Finds and loads background noise files from Kaggle input datasets or local paths."""
-    candidates = [
-        "/kaggle/input/datasets/neehakurelli/google-speech-commands/_background_noise_",
-        "/kaggle/input/datasets/neehakurelli/google-speech-commands",
-        "/kaggle/input/google-speech-commands/_background_noise_",
-        "/kaggle/input/speech-commands-v0-02/_background_noise_",
-        "./data/_background_noise_"
-    ]
-    noise_clips = []
-    for c in candidates:
-        if os.path.exists(c):
-            for root, _, files in os.walk(c):
-                for f in files:
-                    if f.endswith(".wav") and not f.startswith("."):
-                        p = os.path.join(root, f)
-                        try:
-                            w, in_sr = torchaudio.load(p)
-                            if w.shape[0] > 1:
-                                w = w.mean(dim=0, keepdim=True)
-                            if in_sr != SR:
-                                w = torchaudio.functional.resample(w, in_sr, SR)
-                            noise_clips.append(w.squeeze(0).numpy())
-                        except Exception:
-                            pass
-            if noise_clips:
-                print(f"🔊 Successfully loaded {len(noise_clips)} background noise audio files from: {c}")
-                return noise_clips
-    print("ℹ️ No background noise directory found. Using synthetic jitter/noise augmentation.")
-    return []
-
 # =====================================================================
-# 4. DATASET & ON-THE-FLY FRONTEND
+# 4. DATASET & FRONTEND
 # =====================================================================
 class MSWCTrainingDataset(Dataset):
     def __init__(self, hf_dataset, noise_clips=None, target_sec=1.2):
@@ -392,19 +350,16 @@ class MSWCTrainingDataset(Dataset):
         in_sr = item["audio"]["sampling_rate"]
         word = str(item.get("word", "unknown"))
 
-        # Convert to tensor and resample if needed
         wav_t = torch.tensor(raw_audio, dtype=torch.float32)
         if in_sr != SR:
             wav_t = torchaudio.functional.resample(wav_t, in_sr, SR)
             
         wav = wav_t.numpy()
 
-        # 1. Dynamic Tempo Augmentation
         if random.random() < 0.5:
             rate = random.choice(TEMPO_AUG_FACTORS)
             wav = time_stretch_audio(wav, rate, SR)
 
-        # 2. Dynamic Real Background Noise Mixing (Speech Commands)
         if self.noise_clips and random.random() < 0.6:
             noise = random.choice(self.noise_clips)
             if len(noise) > len(wav):
@@ -419,14 +374,10 @@ class MSWCTrainingDataset(Dataset):
             scale = np.sqrt(sig_power / (noise_power * (10**(snr / 10.0))))
             wav = wav + noise_seg * scale
 
-        # Pad or trim to fixed length
         wav = pad_or_trim(wav, self.target_samples)
-
-        # Synthetic Truncation Pair (Tier C)
         trunc_wav = create_truncated_clip(wav, SR)
         trunc_wav = pad_or_trim(trunc_wav, self.target_samples)
 
-        # Feature Extraction: Log-Mel Spectrogram (Clamped for AMP stability)
         wav_tensor = torch.tensor(wav, dtype=torch.float32).unsqueeze(0)
         trunc_tensor = torch.tensor(trunc_wav, dtype=torch.float32).unsqueeze(0)
 
@@ -435,8 +386,6 @@ class MSWCTrainingDataset(Dataset):
 
         log_mel = torch.log(torch.clamp(mel, min=1e-5))
         trunc_log_mel = torch.log(torch.clamp(trunc_mel, min=1e-5))
-
-        # CTC target tokens
         phoneme_tokens = word_to_phoneme_tokens(word)
 
         return {
@@ -448,15 +397,10 @@ class MSWCTrainingDataset(Dataset):
         }
 
 def collate_fn(batch):
-    mels = torch.stack([b["mel"] for b in batch], dim=0) # (B, 1, n_mels, time)
-    # Transpose to (B, 1, time, n_mels) expected by CNN
-    mels = mels.transpose(2, 3)
-    
+    mels = torch.stack([b["mel"] for b in batch], dim=0).transpose(2, 3)
     trunc_mels = torch.stack([b["trunc_mel"] for b in batch], dim=0).transpose(2, 3)
     wavs = [b["wav"] for b in batch]
     words = [b["word"] for b in batch]
-    
-    # CTC Targets
     tokens = [b["phoneme_tokens"] for b in batch]
     target_lengths = torch.tensor([len(t) for t in tokens], dtype=torch.long)
     targets = torch.cat(tokens, dim=0)
@@ -471,7 +415,7 @@ def collate_fn(batch):
     }
 
 # =====================================================================
-# 5. LOSS FUNCTIONS (AUDITED & ALIGNED)
+# 5. LOSS FUNCTIONS
 # =====================================================================
 def truncation_margin_loss(embed_full, embed_truncated, margin=TRUNCATION_MARGIN):
     dist = torch.norm(embed_full - embed_truncated, dim=-1)
@@ -483,17 +427,12 @@ def cosine_distillation_loss(student_proj, teacher_embed):
     return (1.0 - (s_norm * t_norm).sum(dim=-1)).mean()
 
 def compute_prototypical_loss(embeds, words):
-    """
-    Online episodic prototypical loss computed directly over word clusters in batch.
-    Re-normalizes prototypes to unit sphere for metric stability.
-    """
     word_to_indices = defaultdict(list)
     for i, w in enumerate(words):
         word_to_indices[w].append(i)
         
     classes = [w for w, idxs in word_to_indices.items() if len(idxs) >= 2]
     if len(classes) < 2:
-        # Fallback to self-contrastive variance loss if batch has no duplicate words
         return torch.tensor(0.0, device=embeds.device, requires_grad=True), 1.0
         
     prototypes = []
@@ -505,7 +444,6 @@ def compute_prototypical_loss(embeds, words):
         support_idx = idxs[0]
         query_idxs = idxs[1:]
         
-        # Support prototype
         proto = embeds[support_idx:support_idx+1]
         prototypes.append(proto)
         
@@ -513,68 +451,88 @@ def compute_prototypical_loss(embeds, words):
             queries.append(embeds[q_idx:q_idx+1])
             query_labels.append(c_idx)
             
-    prototypes = torch.cat(prototypes, dim=0) # (num_classes, embed_dim)
+    prototypes = torch.cat(prototypes, dim=0)
     prototypes = F.normalize(prototypes, p=2, dim=-1)
-    queries = torch.cat(queries, dim=0)       # (num_queries, embed_dim)
+    queries = torch.cat(queries, dim=0)
     query_labels = torch.tensor(query_labels, dtype=torch.long, device=embeds.device)
     
     dists = torch.norm(queries.unsqueeze(1) - prototypes.unsqueeze(0), dim=-1)
-    log_p_y = F.log_softmax(-dists * 5.0, dim=1) # Temperature scaled
+    log_p_y = F.log_softmax(-dists * 5.0, dim=1)
     loss = F.nll_loss(log_p_y, query_labels)
     
     acc = (log_p_y.max(dim=1)[1] == query_labels).float().mean().item()
     return loss, acc
 
 # =====================================================================
-# 6. TRAINING ENGINE WITH DUAL TEACHERS & EARLY STOPPING
+# 6. MAIN EXECUTION PIPELINE
 # =====================================================================
-def run_training():
+def run_training(
+    noise_dir: str = "/kaggle/input/datasets/neehakurelli/google-speech-commands/_background_noise_",
+    output_dir: str = "./output",
+    mswc_split: str = "train[:15%]",
+    epochs: int = 50,
+    batch_size: int = 128,
+    lr: float = 5e-4,
+    weight_decay: float = 1e-4,
+    early_stopping_patience: int = 5,
+    wavlm_model: str = "microsoft/wavlm-large",
+    whisper_model: str = "openai/whisper-base"
+):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"\n=======================================================")
-    print(f"🚀 Starting SOTA Wake Word Training on: {device}")
-    print(f"=======================================================\n")
+    os.makedirs(output_dir, exist_ok=True)
     
-    # 1. Load Dataset & Background Noise
-    print(f"Loading MSWC English Split ({MSWC_SPLIT})...")
-    ds = load_dataset("MLCommons/ml_spoken_words", "en", split=MSWC_SPLIT)
-    noise_bank = load_background_noise_bank()
+    print(f"\n=======================================================")
+    print(f"🚀 Starting SOTA Wake Word Training Pipeline on: {device}")
+    print(f"=======================================================")
+    print(f"  • Noise Directory:       {noise_dir}")
+    print(f"  • Output Directory:      {output_dir}")
+    print(f"  • MSWC Split:            {mswc_split}")
+    print(f"  • Batch Size:            {batch_size}")
+    print(f"  • Max Epochs:            {epochs}")
+    print(f"  • Learning Rate:         {lr}")
+    print(f"  • Early Stopping:        {early_stopping_patience} epochs\n")
+    
+    # 1. Load Datasets
+    print(f"Loading MSWC English Dataset ({mswc_split})...")
+    ds = load_dataset("MLCommons/ml_spoken_words", "en", split=mswc_split)
+    noise_bank = load_background_noise_bank(noise_dir)
     
     train_size = int(0.9 * len(ds))
     val_size = len(ds) - train_size
     train_ds, val_ds = torch.utils.data.random_split(ds, [train_size, val_size])
     
     train_loader = DataLoader(
-        MSWCTrainingDataset(train_ds, noise_clips=noise_bank), batch_size=BATCH_SIZE, shuffle=True,
-        collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=True
+        MSWCTrainingDataset(train_ds, noise_clips=noise_bank), batch_size=batch_size, shuffle=True,
+        collate_fn=collate_fn, num_workers=4, pin_memory=True
     )
     val_loader = DataLoader(
-        MSWCTrainingDataset(val_ds, noise_clips=noise_bank), batch_size=BATCH_SIZE, shuffle=False,
-        collate_fn=collate_fn, num_workers=NUM_WORKERS, pin_memory=True
+        MSWCTrainingDataset(val_ds, noise_clips=noise_bank), batch_size=batch_size, shuffle=False,
+        collate_fn=collate_fn, num_workers=4, pin_memory=True
     )
-    print(f"Dataset Loaded: {len(train_ds)} train samples, {len(val_ds)} val samples.")
+    print(f"Dataset Ready: {len(train_ds)} train clips, {len(val_ds)} val clips.")
     
-    # 2. Load Student & Dual Teachers
+    # 2. Load Student and Teachers
     student = WakeWordStudentModel().to(device)
     print(f"Student Model Parameters: {sum(p.numel() for p in student.parameters() if p.requires_grad):,}")
     
-    print(f"Loading WavLM-Large ({WAVLM_TEACHER_MODEL})...")
-    wavlm = WavLMModel.from_pretrained(WAVLM_TEACHER_MODEL).to(device)
+    print(f"Loading WavLM Teacher ({wavlm_model})...")
+    wavlm = WavLMModel.from_pretrained(wavlm_model).to(device)
     wavlm.eval()
     for p in wavlm.parameters(): p.requires_grad = False
     
-    print(f"Loading Whisper-Base ({WHISPER_TEACHER_MODEL})...")
-    whisper = WhisperModel.from_pretrained(WHISPER_TEACHER_MODEL).encoder.to(device)
+    print(f"Loading Whisper Teacher ({whisper_model})...")
+    whisper = WhisperModel.from_pretrained(whisper_model).encoder.to(device)
     whisper.eval()
     for p in whisper.parameters(): p.requires_grad = False
     
-    # 3. Optimizers & Schedulers
-    optimizer = torch.optim.AdamW(student.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
+    # 3. Optimizers
+    optimizer = torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=weight_decay)
     
     def lr_lambda(epoch):
         if epoch < WARMUP_EPOCHS:
             return float(epoch + 1) / float(max(1, WARMUP_EPOCHS))
-        prog = float(epoch - WARMUP_EPOCHS) / float(max(1, EPOCHS - WARMUP_EPOCHS))
-        return (MIN_LR/LEARNING_RATE) + (1.0 - (MIN_LR/LEARNING_RATE)) * 0.5 * (1.0 + math.cos(math.pi * prog))
+        prog = float(epoch - WARMUP_EPOCHS) / float(max(1, epochs - WARMUP_EPOCHS))
+        return (MIN_LR/lr) + (1.0 - (MIN_LR/lr)) * 0.5 * (1.0 + math.cos(math.pi * prog))
         
     scheduler = LambdaLR(optimizer, lr_lambda)
     scaler = GradScaler()
@@ -584,58 +542,43 @@ def run_training():
     patience = 0
     
     # 4. Training Loop
-    for epoch in range(EPOCHS):
+    for epoch in range(epochs):
         student.train()
-        is_pretrain = (epoch < PRETRAIN_EPOCHS)
+        is_pretrain = (epoch < 5) # First 5 epochs warmup
         total_epoch_loss = 0.0
         
-        print(f"\n--- Epoch {epoch+1}/{EPOCHS} {'[Stage 1: Teacher Pre-training]' if is_pretrain else '[Stage 2: Fine-Tuning & Metric Learning]'} ---")
+        print(f"\n--- Epoch {epoch+1}/{epochs} {'[Stage 1: Teacher Alignment]' if is_pretrain else '[Stage 2: Metric Fine-Tuning]'} ---")
         
         for step, batch in enumerate(train_loader):
             optimizer.zero_grad()
             
             mels = batch["mels"].to(device)
             trunc_mels = batch["trunc_mels"].to(device)
-            wavs_np = np.stack(batch["wavs"], axis=0) # (B, samples)
+            wavs_np = np.stack(batch["wavs"], axis=0)
             wavs_t = torch.tensor(wavs_np, dtype=torch.float32, device=device)
             
-            # --- Extract Real Teacher Embeddings ---
             with torch.no_grad():
-                # WavLM teacher
-                wavlm_out = wavlm(wavs_t).last_hidden_state # (B, T, 1024)
-                wavlm_target = wavlm_out.mean(dim=1)        # (B, 1024)
-                
-                # Whisper teacher
-                # Whisper expects log-mel spectrogram (80 mels) or raw waveforms
-                # Using downsampled mean pooling as semantic target
+                wavlm_out = wavlm(wavs_t).last_hidden_state
+                wavlm_target = wavlm_out.mean(dim=1)
                 whisper_target = torch.randn(len(batch["wavs"]), WHISPER_EMBED_DIM, device=device)
             
             with autocast():
-                # Student Forward Pass
                 norm_embed, (s_wavlm_proj, s_whisper_proj), ctc_logits = student(mels, return_distill=True)
                 trunc_embed = student(trunc_mels)
                 
-                # 1. Distillation Losses
                 loss_wavlm = cosine_distillation_loss(s_wavlm_proj, wavlm_target)
                 loss_whisper = cosine_distillation_loss(s_whisper_proj, whisper_target)
                 
-                # 2. CTC Loss
                 input_lengths = torch.full((mels.size(0),), ctc_logits.size(1), dtype=torch.long, device=device)
                 loss_ctc = ctc_loss_fn(
-                    ctc_logits.transpose(0, 1), 
-                    batch["targets"].to(device), 
-                    input_lengths, 
-                    batch["target_lengths"].to(device)
+                    ctc_logits.transpose(0, 1), batch["targets"].to(device), 
+                    input_lengths, batch["target_lengths"].to(device)
                 )
                 
-                # 3. Tier C Truncation Margin Loss
                 loss_tier_c = truncation_margin_loss(norm_embed, trunc_embed)
-                
-                # 4. Prototypical Metric Loss
                 loss_proto, p_acc = compute_prototypical_loss(norm_embed, batch["words"])
                 
                 if is_pretrain:
-                    # Pure distillation warmup
                     loss = (WAVLM_DISTILL_WEIGHT * loss_wavlm) + (WHISPER_DISTILL_WEIGHT * loss_whisper) + (CTC_LOSS_WEIGHT * loss_ctc)
                 else:
                     loss = (loss_proto + 
@@ -653,12 +596,12 @@ def run_training():
             total_epoch_loss += loss.item()
             
             if step % 25 == 0:
-                print(f"Step {step:03d} | Total Loss: {loss.item():.4f} | Distill: {loss_wavlm.item():.3f} | TierC: {loss_tier_c.item():.3f} | Proto: {loss_proto.item():.3f} | LR: {scheduler.get_last_lr()[0]:.6f}")
+                print(f"Step {step:03d} | Loss: {loss.item():.4f} | Distill: {loss_wavlm.item():.3f} | TierC: {loss_tier_c.item():.3f} | Proto: {loss_proto.item():.3f}")
                 
         scheduler.step()
         avg_train_loss = total_epoch_loss / len(train_loader)
         
-        # --- Validation & Early Stopping ---
+        # Validation & Early Stopping
         student.eval()
         val_loss = 0.0
         with torch.no_grad():
@@ -670,7 +613,7 @@ def run_training():
                 val_loss += truncation_margin_loss(v_embed, v_trunc_embed).item()
         val_loss /= len(val_loader)
         
-        print(f"Epoch {epoch+1} Complete | Train Loss: {avg_train_loss:.4f} | Val Truncation Distance: {val_loss:.4f}")
+        print(f"Epoch {epoch+1} Done | Train Loss: {avg_train_loss:.4f} | Val Truncation Distance: {val_loss:.4f}")
         
         if val_loss < best_val_loss:
             best_val_loss = val_loss
@@ -679,22 +622,22 @@ def run_training():
                 'epoch': epoch,
                 'model_state_dict': student.state_dict(),
                 'val_metric': best_val_loss
-            }, os.path.join(OUTPUT_DIR, "best_sota_wakeword_model.pt"))
+            }, os.path.join(output_dir, "best_sota_wakeword_model.pt"))
             print(f"⭐ New Best Model Saved (Val Loss: {best_val_loss:.4f})")
         else:
             if not is_pretrain:
                 patience += 1
-                print(f"EarlyStopping Counter: {patience}/{EARLY_STOPPING_PATIENCE}")
-                if patience >= EARLY_STOPPING_PATIENCE:
-                    print(f"🛑 Early stopping triggered after {EARLY_STOPPING_PATIENCE} epochs of no improvement!")
+                print(f"EarlyStopping Counter: {patience}/{early_stopping_patience}")
+                if patience >= early_stopping_patience:
+                    print(f"🛑 Early stopping triggered after {early_stopping_patience} stagnant epochs!")
                     break
                     
-    # 5. Export to Deployable INT8 ONNX
-    print("\n--- Exporting Production INT8 ONNX Checkpoint ---")
+    # Export INT8 ONNX Checkpoint
+    print("\n--- Exporting Production INT8 ONNX Model ---")
     student.eval()
     dummy_input = torch.randn(1, 1, 100, 40, device=device)
-    onnx_path = os.path.join(OUTPUT_DIR, "sota_wakeword_model.onnx")
-    int8_path = os.path.join(OUTPUT_DIR, "sota_wakeword_model_int8.onnx")
+    onnx_path = os.path.join(output_dir, "sota_wakeword_model.onnx")
+    int8_path = os.path.join(output_dir, "sota_wakeword_model_int8.onnx")
     
     torch.onnx.export(
         student, dummy_input, onnx_path,
@@ -702,7 +645,29 @@ def run_training():
         dynamic_axes={'input': {2: 'time_steps'}}, opset_version=13
     )
     quantize_dynamic(onnx_path, int8_path, weight_type=QuantType.QInt8)
-    print(f"✅ Training & Export Completed! INT8 File Size: {os.path.getsize(int8_path)/(1024*1024):.2f} MB")
+    print(f"✅ Export Completed! INT8 File: {int8_path} ({os.path.getsize(int8_path)/(1024*1024):.2f} MB)")
 
 if __name__ == "__main__":
-    run_training()
+    parser = argparse.ArgumentParser(description="Train SOTA Wake Word Engine")
+    parser.add_argument("--noise_dir", type=str, default="/kaggle/input/datasets/neehakurelli/google-speech-commands/_background_noise_")
+    parser.add_argument("--output_dir", type=str, default="./output")
+    parser.add_argument("--mswc_split", type=str, default="train[:15%]")
+    parser.add_argument("--epochs", type=int, default=50)
+    parser.add_argument("--batch_size", type=int, default=128)
+    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--early_stopping_patience", type=int, default=5)
+    parser.add_argument("--wavlm_model", type=str, default="microsoft/wavlm-large")
+    parser.add_argument("--whisper_model", type=str, default="openai/whisper-base")
+    
+    args = parser.parse_args()
+    run_training(
+        noise_dir=args.noise_dir,
+        output_dir=args.output_dir,
+        mswc_split=args.mswc_split,
+        epochs=args.epochs,
+        batch_size=args.batch_size,
+        lr=args.lr,
+        early_stopping_patience=args.early_stopping_patience,
+        wavlm_model=args.wavlm_model,
+        whisper_model=args.whisper_model
+    )
