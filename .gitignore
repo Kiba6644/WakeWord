@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+output/
+runs/
+data/
+*.pt
+*.onnx
+.ipynb_checkpoints/
+desktop.ini
