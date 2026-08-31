@@ -343,11 +343,16 @@ class WakeWordModel(nn.Module):
             
         return norm_embed
 
-def load_speech_dataset(mswc_split: str):
+def load_speech_dataset(mswc_split: str, dataset_path: str = None):
     """
     Loads MSWC (Multilingual Spoken Words Corpus) English dataset.
-    Requires datasets < 3.0.0 for legacy dataset script compatibility.
+    If dataset_path is provided and exists, loads directly from disk in seconds.
     """
+    if dataset_path and os.path.exists(dataset_path):
+        print(f"⚡ Loading pre-processed MSWC dataset directly from disk: {dataset_path}")
+        from datasets import load_from_disk
+        return load_from_disk(dataset_path)
+
     print(f"Loading primary MSWC English dataset ({mswc_split})...")
     try:
         ds = load_dataset("MLCommons/ml_spoken_words", "en_opus", split=mswc_split, trust_remote_code=True)
@@ -513,6 +518,8 @@ def compute_prototypical_loss(embeds, words):
 def run_training(
     noise_dir: str = "/kaggle/input/datasets/neehakurelli/google-speech-commands/_background_noise_",
     output_dir: str = "./output",
+    dataset_path: str = None,
+    resume_path: str = None,
     mswc_split: str = "train[:15%]",
     epochs: int = 50,
     batch_size: int = 128,
@@ -531,13 +538,15 @@ def run_training(
     print(f"  • Noise Directory:       {noise_dir}")
     print(f"  • Output Directory:      {output_dir}")
     print(f"  • MSWC Split:            {mswc_split}")
+    print(f"  • Dataset Path:          {dataset_path or 'Online Download'}")
+    print(f"  • Resume Checkpoint:     {resume_path or 'Auto-Detect'}")
     print(f"  • Batch Size:            {batch_size}")
     print(f"  • Max Epochs:            {epochs}")
     print(f"  • Learning Rate:         {lr}")
     print(f"  • Early Stopping:        {early_stopping_patience} epochs\n")
     
     # 1. Load Datasets
-    ds = load_speech_dataset(mswc_split)
+    ds = load_speech_dataset(mswc_split, dataset_path=dataset_path)
     noise_bank = load_background_noise_bank(noise_dir)
     
     train_size = int(0.9 * len(ds))
@@ -585,9 +594,23 @@ def run_training(
     
     best_val_loss = float("inf")
     patience = 0
+    start_epoch = 0
+
+    # Auto-detect or load resume checkpoint
+    target_resume = resume_path or os.path.join(output_dir, "best_sota_wakeword_model.pt")
+    if os.path.exists(target_resume):
+        print(f"🔄 Checkpoint found at '{target_resume}'! Resuming training state...")
+        checkpoint = torch.load(target_resume, map_location=device)
+        student.load_state_dict(checkpoint['model_state_dict'])
+        if 'epoch' in checkpoint:
+            start_epoch = checkpoint['epoch'] + 1
+            print(f"   ✓ Successfully resumed! Starting from Epoch {start_epoch + 1}/{epochs}")
+        if 'val_metric' in checkpoint:
+            best_val_loss = checkpoint['val_metric']
+            print(f"   ✓ Best validation loss restored: {best_val_loss:.4f}")
     
     # 4. Training Loop
-    for epoch in range(epochs):
+    for epoch in range(start_epoch, epochs):
         student.train()
         is_pretrain = (epoch < 5) # First 5 epochs warmup
         total_epoch_loss = 0.0
@@ -611,7 +634,7 @@ def run_training(
                 wavlm_out = wavlm(wavs_t).last_hidden_state
                 wavlm_target = wavlm_out.mean(dim=1)
                 
-                # Whisper target (REAL, not random)
+                # Whisper target (REAL, 3000 frames)
                 whisper_inputs = whisper_extractor(
                     [w for w in wavs_np], sampling_rate=SR, return_tensors="pt"
                 ).input_features.to(device)
@@ -720,6 +743,8 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train SOTA Wake Word Engine")
     parser.add_argument("--noise_dir", type=str, default="/kaggle/input/datasets/neehakurelli/google-speech-commands/_background_noise_")
     parser.add_argument("--output_dir", type=str, default="./output")
+    parser.add_argument("--dataset_path", type=str, default=None, help="Path to pre-processed local dataset directory")
+    parser.add_argument("--resume_path", type=str, default=None, help="Path to checkpoint .pt file to resume training from")
     parser.add_argument("--mswc_split", type=str, default="train[:15%]")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=128)
@@ -732,6 +757,8 @@ if __name__ == "__main__":
     run_training(
         noise_dir=args.noise_dir,
         output_dir=args.output_dir,
+        dataset_path=args.dataset_path,
+        resume_path=args.resume_path,
         mswc_split=args.mswc_split,
         epochs=args.epochs,
         batch_size=args.batch_size,
