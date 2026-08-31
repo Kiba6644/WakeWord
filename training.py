@@ -817,20 +817,37 @@ def run_training(
                     print(f"🛑 Early stopping triggered after {early_stopping_patience} stagnant epochs!")
                     break
                     
-    # Export INT8 ONNX Checkpoint
+    # ==========================================
+    # 6. EXPORT INT8 ONNX MODEL
+    # ==========================================
     print("\n--- Exporting Production INT8 ONNX Model ---")
+    student.load_state_dict(torch.load(os.path.join(output_dir, "best_sota_wakeword_model.pt"), map_location=device)['model_state_dict'])
     student.eval()
-    dummy_input = torch.randn(1, 1, 100, 40, device=device)
-    onnx_path = os.path.join(output_dir, "sota_wakeword_model.onnx")
-    int8_path = os.path.join(output_dir, "sota_wakeword_model_int8.onnx")
     
-    torch.onnx.export(
-        student, dummy_input, onnx_path,
-        input_names=['input'], output_names=['output'],
-        dynamic_axes={'input': {2: 'time_steps'}}, opset_version=13
-    )
-    quantize_dynamic(onnx_path, int8_path, weight_type=QuantType.QInt8)
-    print(f"✅ Export Completed! INT8 File: {int8_path} ({os.path.getsize(int8_path)/(1024*1024):.2f} MB)")
+    dummy_input = torch.randn(1, 40, int(1.2 * SR / HOP_LENGTH)).to(device)
+    onnx_path = os.path.join(output_dir, "wakeword_student.onnx")
+    
+    try:
+        torch.onnx.export(
+            student, dummy_input, onnx_path,
+            export_params=True, opset_version=14, do_constant_folding=True,
+            input_names=['input_mel'], output_names=['embedding'],
+            dynamic_axes={'input_mel': {0: 'batch_size', 2: 'time'}, 'embedding': {0: 'batch_size'}}
+        )
+        print(f"✅ ONNX Exported: {onnx_path}")
+        
+        try:
+            import onnx
+            from onnxruntime.quantization import quantize_dynamic, QuantType
+            quant_onnx_path = os.path.join(output_dir, "wakeword_student_int8.onnx")
+            quantize_dynamic(onnx_path, quant_onnx_path, weight_type=QuantType.QUInt8)
+            print(f"✅ INT8 ONNX Exported: {quant_onnx_path}")
+        except ImportError:
+            print("⚠️ 'onnxruntime' not found. Skipping INT8 quantization.")
+            
+    except Exception as e:
+        print(f"⚠️ ONNX Export failed: {e}")
+        print("💡 Tip: Run `!pip install onnxscript onnx onnxruntime` in your Kaggle notebook.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Train SOTA Wake Word Engine")
