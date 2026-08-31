@@ -99,7 +99,6 @@ class WakeWordModel(nn.Module):
         super().__init__()
         self.encoder = DSCNNEncoder(in_channels=1, channels=channels)
         self.temporal_head_type = temporal_head
-        self.spatial_pool = nn.AdaptiveAvgPool2d((None, 1))
         
         if temporal_head == "attention":
             self.temporal = MultiHeadAttentionPooling(channels[-1], embed_dim)
@@ -130,7 +129,7 @@ class WakeWordModel(nn.Module):
         if x.ndim == 3:
             x = x.unsqueeze(1)
         feat = self.encoder(x)
-        feat = self.spatial_pool(feat).squeeze(-1)
+        feat = feat.mean(dim=-1)
         feat = feat.transpose(1, 2)
         return feat
 

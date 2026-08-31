@@ -31,7 +31,7 @@ from audio_utils import endpoint_utterance, time_stretch_audio, generate_phoneti
 from inference import WakeWordCascade
 
 PROFILE_PATH = "wakeword_profile.json"
-DEFAULT_MODEL_PATH = "output/sota_wakeword_model_int8.onnx"
+DEFAULT_MODEL_PATH = "wakeword_student.onnx"
 
 class LiveWakeWordEngine:
     def __init__(self, model_path=DEFAULT_MODEL_PATH, phrase="Hey Karthika"):
