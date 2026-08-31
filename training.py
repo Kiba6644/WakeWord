@@ -553,13 +553,15 @@ def run_training(
     val_size = len(ds) - train_size
     train_ds, val_ds = torch.utils.data.random_split(ds, [train_size, val_size])
     
+    torch.backends.cudnn.benchmark = True
+    
     train_loader = DataLoader(
         MSWCTrainingDataset(train_ds, noise_clips=noise_bank), batch_size=batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=4, pin_memory=True
+        collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True
     )
     val_loader = DataLoader(
         MSWCTrainingDataset(val_ds, noise_clips=noise_bank), batch_size=batch_size, shuffle=False,
-        collate_fn=collate_fn, num_workers=4, pin_memory=True
+        collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True
     )
     print(f"Dataset Ready: {len(train_ds)} train clips, {len(val_ds)} val clips.")
     
@@ -618,10 +620,10 @@ def run_training(
         print(f"\n--- Epoch {epoch+1}/{epochs} {'[Stage 1: Teacher Alignment]' if is_pretrain else '[Stage 2: Metric Fine-Tuning]'} ---")
         
         for step, batch in enumerate(train_loader):
-            optimizer.zero_grad()
+            optimizer.zero_grad(set_to_none=True)
             
-            mels = batch["mels"].to(device)
-            trunc_mels = batch["trunc_mels"].to(device)
+            mels = batch["mels"].to(device, non_blocking=True)
+            trunc_mels = batch["trunc_mels"].to(device, non_blocking=True)
             wavs_np = np.stack(batch["wavs"], axis=0)
             wavs_t = torch.tensor(wavs_np, dtype=torch.float32, device=device)
             
@@ -629,15 +631,15 @@ def run_training(
             energy = mels.mean(dim=-1).squeeze(1) # (B, T)
             attention_mask = energy > -10.0
             
-            with torch.no_grad():
-                # WavLM target
+            with torch.no_grad(), autocast():
+                # WavLM target (Accelerated with FP16 Tensor Cores)
                 wavlm_out = wavlm(wavs_t).last_hidden_state
                 wavlm_target = wavlm_out.mean(dim=1)
                 
-                # Whisper target (REAL, 3000 frames)
+                # Whisper target (Accelerated with FP16 Tensor Cores)
                 whisper_inputs = whisper_extractor(
                     [w for w in wavs_np], sampling_rate=SR, return_tensors="pt"
-                ).input_features.to(device)
+                ).input_features.to(device, non_blocking=True)
                 whisper_out = whisper(whisper_inputs).last_hidden_state
                 whisper_target = whisper_out.mean(dim=1)
             
