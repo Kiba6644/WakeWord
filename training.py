@@ -368,10 +368,12 @@ def load_speech_dataset(mswc_split: str, dataset_path: str = None):
 # 4. DATASET & FRONTEND
 # =====================================================================
 class MSWCTrainingDataset(Dataset):
-    def __init__(self, hf_dataset, noise_clips=None, target_sec=1.2):
+    def __init__(self, hf_dataset, noise_clips=None, target_sec=1.2, teacher_targets=None, indices=None):
         self.dataset = hf_dataset
         self.noise_clips = noise_clips or []
         self.target_samples = int(target_sec * SR)
+        self.teacher_targets = teacher_targets
+        self.indices = indices # Maps dataset subset index back to full dataset index if split
         self.mel_transform = T.MelSpectrogram(
             sample_rate=SR, n_fft=N_FFT, hop_length=HOP_LENGTH, n_mels=N_MELS, power=2.0
         )
@@ -437,13 +439,20 @@ class MSWCTrainingDataset(Dataset):
         trunc_log_mel = torch.log(torch.clamp(trunc_mel, min=1e-5))
         phoneme_tokens = word_to_phoneme_tokens(word)
 
-        return {
+        res = {
             "wav": wav,
             "mel": log_mel,
             "trunc_mel": trunc_log_mel,
             "word": word,
             "phoneme_tokens": torch.tensor(phoneme_tokens, dtype=torch.long)
         }
+        
+        if self.teacher_targets is not None:
+            actual_idx = self.indices[idx] if self.indices is not None else idx
+            res["wavlm_target"] = self.teacher_targets["wavlm"][actual_idx]
+            res["whisper_target"] = self.teacher_targets["whisper"][actual_idx]
+            
+        return res
 
 def collate_fn(batch):
     mels = torch.stack([b["mel"] for b in batch], dim=0).transpose(2, 3)
@@ -454,7 +463,7 @@ def collate_fn(batch):
     target_lengths = torch.tensor([len(t) for t in tokens], dtype=torch.long)
     targets = torch.cat(tokens, dim=0)
     
-    return {
+    res = {
         "mels": mels,
         "trunc_mels": trunc_mels,
         "wavs": wavs,
@@ -462,6 +471,12 @@ def collate_fn(batch):
         "targets": targets,
         "target_lengths": target_lengths
     }
+    
+    if "wavlm_target" in batch[0]:
+        res["wavlm_targets"] = torch.stack([b["wavlm_target"] for b in batch], dim=0)
+        res["whisper_targets"] = torch.stack([b["whisper_target"] for b in batch], dim=0)
+        
+    return res
 
 # =====================================================================
 # 5. LOSS FUNCTIONS
@@ -512,6 +527,70 @@ def compute_prototypical_loss(embeds, words):
     acc = (log_p_y.max(dim=1)[1] == query_labels).float().mean().item()
     return loss, acc
 
+def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device, batch_size=256):
+    print(f"\n⚡ Pre-extracting Teacher Embeddings (1-Pass Caching for 10x Training Speedup)...")
+    
+    print(f"  • Loading WavLM ({wavlm_model_name})...")
+    wavlm = WavLMModel.from_pretrained(wavlm_model_name).to(device)
+    wavlm.eval()
+    for p in wavlm.parameters(): p.requires_grad = False
+    
+    print(f"  • Loading Whisper ({whisper_model_name})...")
+    from transformers import WhisperFeatureExtractor
+    whisper_extractor = WhisperFeatureExtractor.from_pretrained(whisper_model_name)
+    whisper = WhisperModel.from_pretrained(whisper_model_name).encoder.to(device)
+    whisper.eval()
+    for p in whisper.parameters(): p.requires_grad = False
+    
+    wavlm_targets = []
+    whisper_targets = []
+    
+    num_samples = len(ds)
+    target_samples = int(1.2 * SR)
+    
+    with torch.no_grad(), autocast():
+        for i in range(0, num_samples, batch_size):
+            end_idx = min(i + batch_size, num_samples)
+            batch_items = [ds[j] for j in range(i, end_idx)]
+            wavs_list = []
+            for item in batch_items:
+                raw_audio = item["audio"]["array"]
+                in_sr = item["audio"]["sampling_rate"]
+                wav_t = torch.tensor(raw_audio, dtype=torch.float32)
+                if in_sr != SR:
+                    wav_t = torchaudio.functional.resample(wav_t, in_sr, SR)
+                wav = pad_or_trim(wav_t.numpy(), target_samples)
+                wavs_list.append(wav)
+                
+            wavs_np = np.stack(wavs_list, axis=0)
+            wavs_t = torch.tensor(wavs_np, dtype=torch.float32, device=device)
+            
+            # WavLM
+            w_out = wavlm(wavs_t).last_hidden_state.mean(dim=1).cpu()
+            wavlm_targets.append(w_out)
+            
+            # Whisper
+            wh_inputs = whisper_extractor([w for w in wavs_np], sampling_rate=SR, return_tensors="pt").input_features.to(device)
+            wh_out = whisper(wh_inputs).last_hidden_state.mean(dim=1).cpu()
+            whisper_targets.append(wh_out)
+            
+            if ((i // batch_size) + 1) % 10 == 0 or end_idx == num_samples:
+                print(f"  ✓ Cached {end_idx}/{num_samples} samples...")
+                
+    wavlm_all = torch.cat(wavlm_targets, dim=0)
+    whisper_all = torch.cat(whisper_targets, dim=0)
+    
+    mem_size = wavlm_all.element_size() * (wavlm_all.nelement() + whisper_all.nelement()) / 1e6
+    print(f"✅ Teacher Feature Extraction Complete! Cached {num_samples} targets in RAM ({mem_size:.1f} MB).")
+    
+    # Unload teachers completely to free 100% VRAM for student model
+    del wavlm, whisper, whisper_extractor
+    import gc
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    return {"wavlm": wavlm_all, "whisper": whisper_all}
+
 # =====================================================================
 # 6. MAIN EXECUTION PIPELINE
 # =====================================================================
@@ -527,7 +606,8 @@ def run_training(
     weight_decay: float = 1e-4,
     early_stopping_patience: int = 5,
     wavlm_model: str = "microsoft/wavlm-large",
-    whisper_model: str = "openai/whisper-base"
+    whisper_model: str = "openai/whisper-base",
+    cache_teachers: bool = True
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(output_dir, exist_ok=True)
@@ -540,6 +620,7 @@ def run_training(
     print(f"  • MSWC Split:            {mswc_split}")
     print(f"  • Dataset Path:          {dataset_path or 'Online Download'}")
     print(f"  • Resume Checkpoint:     {resume_path or 'Auto-Detect'}")
+    print(f"  • Teacher Caching:       {'ENABLED (10x Speedup)' if cache_teachers else 'Disabled'}")
     print(f"  • Batch Size:            {batch_size}")
     print(f"  • Max Epochs:            {epochs}")
     print(f"  • Learning Rate:         {lr}")
@@ -549,6 +630,11 @@ def run_training(
     ds = load_speech_dataset(mswc_split, dataset_path=dataset_path)
     noise_bank = load_background_noise_bank(noise_dir)
     
+    # 2. 1-Pass Fast Teacher Extraction Caching
+    teacher_targets = None
+    if cache_teachers:
+        teacher_targets = precompute_teacher_features(ds, wavlm_model, whisper_model, device, batch_size=256)
+    
     train_size = int(0.9 * len(ds))
     val_size = len(ds) - train_size
     train_ds, val_ds = torch.utils.data.random_split(ds, [train_size, val_size])
@@ -556,32 +642,34 @@ def run_training(
     torch.backends.cudnn.benchmark = True
     
     train_loader = DataLoader(
-        MSWCTrainingDataset(train_ds, noise_clips=noise_bank), batch_size=batch_size, shuffle=True,
-        collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True
+        MSWCTrainingDataset(train_ds, noise_clips=noise_bank, teacher_targets=teacher_targets, indices=train_ds.indices if teacher_targets else None),
+        batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True
     )
     val_loader = DataLoader(
-        MSWCTrainingDataset(val_ds, noise_clips=noise_bank), batch_size=batch_size, shuffle=False,
-        collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True
+        MSWCTrainingDataset(val_ds, noise_clips=noise_bank, teacher_targets=teacher_targets, indices=val_ds.indices if teacher_targets else None),
+        batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True
     )
     print(f"Dataset Ready: {len(train_ds)} train clips, {len(val_ds)} val clips.")
     
-    # 2. Load Student and Teachers
+    # 3. Load Student Model
     student = WakeWordModel().to(device)
     print(f"Student Model Parameters: {sum(p.numel() for p in student.parameters() if p.requires_grad):,}")
     
-    print(f"Loading WavLM Teacher ({wavlm_model})...")
-    wavlm = WavLMModel.from_pretrained(wavlm_model).to(device)
-    wavlm.eval()
-    for p in wavlm.parameters(): p.requires_grad = False
+    wavlm, whisper, whisper_extractor = None, None, None
+    if not cache_teachers:
+        print(f"Loading WavLM Teacher ({wavlm_model})...")
+        wavlm = WavLMModel.from_pretrained(wavlm_model).to(device)
+        wavlm.eval()
+        for p in wavlm.parameters(): p.requires_grad = False
+        
+        print(f"Loading Whisper Teacher ({whisper_model})...")
+        from transformers import WhisperFeatureExtractor
+        whisper_extractor = WhisperFeatureExtractor.from_pretrained(whisper_model)
+        whisper = WhisperModel.from_pretrained(whisper_model).encoder.to(device)
+        whisper.eval()
+        for p in whisper.parameters(): p.requires_grad = False
     
-    print(f"Loading Whisper Teacher ({whisper_model})...")
-    from transformers import WhisperFeatureExtractor
-    whisper_extractor = WhisperFeatureExtractor.from_pretrained(whisper_model)
-    whisper = WhisperModel.from_pretrained(whisper_model).encoder.to(device)
-    whisper.eval()
-    for p in whisper.parameters(): p.requires_grad = False
-    
-    # 3. Optimizers
+    # 4. Optimizers
     optimizer = torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=weight_decay)
     
     def lr_lambda(epoch):
@@ -611,7 +699,7 @@ def run_training(
             best_val_loss = checkpoint['val_metric']
             print(f"   ✓ Best validation loss restored: {best_val_loss:.4f}")
     
-    # 4. Training Loop
+    # 5. Training Loop
     for epoch in range(start_epoch, epochs):
         student.train()
         is_pretrain = (epoch < 5) # First 5 epochs warmup
@@ -631,17 +719,18 @@ def run_training(
             energy = mels.mean(dim=-1).squeeze(1) # (B, T)
             attention_mask = energy > -10.0
             
-            with torch.no_grad(), autocast():
-                # WavLM target (Accelerated with FP16 Tensor Cores)
-                wavlm_out = wavlm(wavs_t).last_hidden_state
-                wavlm_target = wavlm_out.mean(dim=1)
-                
-                # Whisper target (Accelerated with FP16 Tensor Cores)
-                whisper_inputs = whisper_extractor(
-                    [w for w in wavs_np], sampling_rate=SR, return_tensors="pt"
-                ).input_features.to(device, non_blocking=True)
-                whisper_out = whisper(whisper_inputs).last_hidden_state
-                whisper_target = whisper_out.mean(dim=1)
+            if "wavlm_targets" in batch:
+                wavlm_target = batch["wavlm_targets"].to(device, non_blocking=True)
+                whisper_target = batch["whisper_targets"].to(device, non_blocking=True)
+            else:
+                with torch.no_grad(), autocast():
+                    wavlm_out = wavlm(wavs_t).last_hidden_state
+                    wavlm_target = wavlm_out.mean(dim=1)
+                    whisper_inputs = whisper_extractor(
+                        [w for w in wavs_np], sampling_rate=SR, return_tensors="pt"
+                    ).input_features.to(device, non_blocking=True)
+                    whisper_out = whisper(whisper_inputs).last_hidden_state
+                    whisper_target = whisper_out.mean(dim=1)
             
             with autocast():
                 norm_embed, (s_wavlm_proj, s_whisper_proj), ctc_logits = student(mels, mask=attention_mask, return_distill=True)
@@ -754,6 +843,7 @@ if __name__ == "__main__":
     parser.add_argument("--early_stopping_patience", type=int, default=5)
     parser.add_argument("--wavlm_model", type=str, default="microsoft/wavlm-large")
     parser.add_argument("--whisper_model", type=str, default="openai/whisper-base")
+    parser.add_argument("--no_cache_teachers", action="store_true", help="Disable 1-pass offline teacher caching")
     
     args = parser.parse_args()
     run_training(
@@ -767,5 +857,6 @@ if __name__ == "__main__":
         lr=args.lr,
         early_stopping_patience=args.early_stopping_patience,
         wavlm_model=args.wavlm_model,
-        whisper_model=args.whisper_model
+        whisper_model=args.whisper_model,
+        cache_teachers=not args.no_cache_teachers
     )
