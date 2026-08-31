@@ -149,7 +149,8 @@ def collate_fn(batch):
 
 def get_dataloaders(batch_size=BATCH_SIZE, num_workers=4):
     print(f"Loading MSWC dataset split ({MSWC_SPLIT})...")
-    ds = load_speech_dataset(MSWC_SPLIT)
+    dataset_path = os.environ.get("KAGGLE_DATASET_PATH", None)
+    ds = load_speech_dataset(MSWC_SPLIT, dataset_path=dataset_path)
     train_dataset = MSWCTrainingDataset(ds)
     train_sampler = DistributedSampler(train_dataset) if torch.distributed.is_initialized() else None
     
