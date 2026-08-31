@@ -482,7 +482,8 @@ def collate_fn(batch):
 # 5. LOSS FUNCTIONS
 # =====================================================================
 def truncation_margin_loss(embed_full, embed_truncated, margin=TRUNCATION_MARGIN):
-    dist = torch.norm(embed_full - embed_truncated, dim=-1)
+    diff = embed_full - embed_truncated
+    dist = torch.sqrt(torch.sum(diff ** 2, dim=-1) + 1e-8)
     return F.relu(margin - dist).mean()
 
 def cosine_distillation_loss(student_proj, teacher_embed):
@@ -520,7 +521,8 @@ def compute_prototypical_loss(embeds, words):
     queries = torch.cat(queries, dim=0)
     query_labels = torch.tensor(query_labels, dtype=torch.long, device=embeds.device)
     
-    dists = torch.norm(queries.unsqueeze(1) - prototypes.unsqueeze(0), dim=-1)
+    diff = queries.unsqueeze(1) - prototypes.unsqueeze(0)
+    dists = torch.sqrt(torch.sum(diff ** 2, dim=-1) + 1e-8)
     log_p_y = F.log_softmax(-dists * 5.0, dim=1)
     loss = F.nll_loss(log_p_y, query_labels)
     
