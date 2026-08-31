@@ -55,7 +55,7 @@ DURATION_GATE_STD = 2.5                   # Legacy fallback — kept for backwar
 
 # Dataset Configuration & Optimal Sizing for Dual-Teacher
 MSWC_LANGUAGES = ["en"]
-MSWC_SPLIT = "train[:10000]"                  # Exact 10,000 clips (~15-minute proof-of-concept)
+MSWC_SPLIT = "train[:150000]"                 # 150,000 clips for production-grade metric learning
 MSWC_MIN_CLIPS_PER_KEYWORD = 30                # Filters out noisy/rare words
 PHONETIC_HARD_NEGATIVE_RATIO = 0.6
 
