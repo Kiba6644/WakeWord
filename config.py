@@ -52,7 +52,7 @@ DURATION_GATE_STD = 2.5
 
 # Dataset Configuration & Optimal Sizing for Dual-Teacher
 MSWC_LANGUAGES = ["en"]
-MSWC_SPLIT = "train[:15%]"                     # Optimal: ~75,000 clips (500-1000 keywords)
+MSWC_SPLIT = "train[:10000]"                  # Exact 10,000 clips (~15-minute proof-of-concept)
 MSWC_MIN_CLIPS_PER_KEYWORD = 30                # Filters out noisy/rare words
 PHONETIC_HARD_NEGATIVE_RATIO = 0.6
 

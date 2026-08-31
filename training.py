@@ -520,7 +520,7 @@ def run_training(
     output_dir: str = "./output",
     dataset_path: str = None,
     resume_path: str = None,
-    mswc_split: str = "train[:15%]",
+    mswc_split: str = "train[:10000]",
     epochs: int = 50,
     batch_size: int = 128,
     lr: float = 5e-4,
@@ -745,7 +745,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="./output")
     parser.add_argument("--dataset_path", type=str, default=None, help="Path to pre-processed local dataset directory")
     parser.add_argument("--resume_path", type=str, default=None, help="Path to checkpoint .pt file to resume training from")
-    parser.add_argument("--mswc_split", type=str, default="train[:15%]")
+    parser.add_argument("--mswc_split", type=str, default="train[:10000]")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=5e-4)
