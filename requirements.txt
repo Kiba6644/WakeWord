@@ -1,0 +1,10 @@
+﻿torch>=2.0.0
+torchaudio
+transformers
+datasets<3.0.0
+numpy
+onnx
+onnxruntime
+sounddevice
+soundfile
+pytest

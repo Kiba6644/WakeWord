@@ -13,10 +13,15 @@ try:
 except ImportError:
     SummaryWriter = None
 
-from config import *
+from config import (STAGE2_CHANNELS, STAGE2_TEMPORAL_HEAD, EMBED_DIM,
+                    WAVLM_TEACHER_MODEL, WHISPER_TEACHER_MODEL, USE_DUAL_DISTILLATION,
+                    LEARNING_RATE, WEIGHT_DECAY, WARMUP_EPOCHS, PRETRAIN_EPOCHS, EPOCHS, 
+                    EARLY_STOPPING_PATIENCE, MIN_LR, GRAD_CLIP_NORM, BATCH_SIZE, NUM_WORKERS, 
+                    OUTPUT_DIR, WAVLM_DISTILL_WEIGHT, WHISPER_DISTILL_WEIGHT, CTC_LOSS_WEIGHT, 
+                    TRUNCATION_AUX_WEIGHT)
 from model import WakeWordModel
 from dataset import get_dataloaders
-from audio_utils import create_truncated_clip
+from losses import truncation_margin_loss, cosine_distillation_loss, supervised_contrastive_loss
 
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
@@ -28,7 +33,6 @@ def cleanup():
     dist.destroy_process_group()
 
 def get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs, min_lr_ratio=MIN_LR/LEARNING_RATE):
-    """Linear warmup followed by cosine annealing decay."""
     def lr_lambda(epoch):
         if epoch < warmup_epochs:
             return float(epoch + 1) / float(max(1, warmup_epochs))
@@ -39,7 +43,7 @@ def get_cosine_schedule_with_warmup(optimizer, warmup_epochs, total_epochs, min_
 def load_dual_teachers(device):
     teachers = {}
     try:
-        from transformers import WavLMModel, WhisperModel
+        from transformers import WavLMModel, WhisperModel, WhisperFeatureExtractor
         print(f"Loading WavLM Teacher ({WAVLM_TEACHER_MODEL})...")
         wavlm = WavLMModel.from_pretrained(WAVLM_TEACHER_MODEL).to(device)
         wavlm.eval()
@@ -48,42 +52,21 @@ def load_dual_teachers(device):
         teachers["wavlm"] = wavlm
 
         print(f"Loading Whisper Teacher ({WHISPER_TEACHER_MODEL})...")
+        whisper_extractor = WhisperFeatureExtractor.from_pretrained(WHISPER_TEACHER_MODEL)
         whisper = WhisperModel.from_pretrained(WHISPER_TEACHER_MODEL).encoder.to(device)
         whisper.eval()
         for p in whisper.parameters():
             p.requires_grad = False
         teachers["whisper"] = whisper
+        teachers["whisper_extractor"] = whisper_extractor
         
     except Exception as e:
         print(f"Teacher models load skipped ({e}). Running student standalone mode.")
     return teachers
 
-def truncation_margin_loss(embed_full, embed_truncated, margin=TRUNCATION_MARGIN):
-    if embed_full is None or embed_truncated is None:
-        return torch.tensor(0.0, device=embed_full.device)
-    dist = torch.norm(embed_full - embed_truncated, dim=-1)
-    return F.relu(margin - dist).mean()
-
-def cosine_distillation_loss(student_proj, teacher_embed):
-    student_norm = F.normalize(student_proj, p=2, dim=-1)
-    teacher_norm = F.normalize(teacher_embed, p=2, dim=-1)
-    cos_sim = (student_norm * teacher_norm).sum(dim=-1)
-    return (1.0 - cos_sim).mean()
-
-def prototypical_loss(support_embeds, query_embeds, query_labels, n_way):
-    prototypes = support_embeds.mean(dim=1)
-    dists = torch.norm(query_embeds.unsqueeze(1) - prototypes.unsqueeze(0), dim=-1)
-    log_p_y = F.log_softmax(-dists, dim=1)
-    loss = F.nll_loss(log_p_y, query_labels)
-    
-    _, y_hat = log_p_y.max(1)
-    acc = torch.eq(y_hat, query_labels).float().mean()
-    return loss, acc
-
 def train(rank, world_size):
     setup(rank, world_size)
     
-    # Initialize Student Model (DS-CNN + MHA + CTC + Dual Projections)
     model = WakeWordModel(
         channels=STAGE2_CHANNELS, 
         temporal_head=STAGE2_TEMPORAL_HEAD, 
@@ -105,41 +88,62 @@ def train(rank, world_size):
         return
 
     writer = SummaryWriter(log_dir=os.path.join(OUTPUT_DIR, "logs")) if (rank == 0 and SummaryWriter) else None
-    model.train()
-    
     best_val_loss = float("inf")
     patience_counter = 0
 
     for epoch in range(EPOCHS):
+        model.train()
         if hasattr(train_loader.sampler, 'set_epoch'):
             train_loader.sampler.set_epoch(epoch)
             
         is_pretrain_phase = (epoch < PRETRAIN_EPOCHS)
         
-        for step, (wavs, labels, words) in enumerate(train_loader):
+        for step, batch in enumerate(train_loader):
             optimizer.zero_grad()
             
             with autocast():
-                # Simulated Multi-Task Training Step
-                proto_loss = torch.tensor(1.0, device=rank, requires_grad=True)
-                aux_loss = torch.tensor(0.5, device=rank, requires_grad=True)
-                wavlm_loss = torch.tensor(0.2, device=rank, requires_grad=True)
-                whisper_loss = torch.tensor(0.15, device=rank, requires_grad=True)
-                ctc_loss = torch.tensor(0.3, device=rank, requires_grad=True)
-                acc = torch.tensor(0.88, device=rank)
+                mels = batch["mels"].to(rank, non_blocking=True)
+                trunc_mels = batch["trunc_mels"].to(rank, non_blocking=True)
+                energy = mels.mean(dim=-1).squeeze(1)
+                attention_mask = energy > -10.0
+                
+                norm_embed, (s_wavlm_proj, s_whisper_proj), ctc_logits = model(mels, mask=attention_mask, return_distill=True)
+                trunc_embed = model(trunc_mels, mask=attention_mask)
+                
+                # Teachers
+                wavlm_target = None
+                whisper_target = None
+                if teachers:
+                    import numpy as np
+                    wavs_np = np.stack(batch["wavs"], axis=0)
+                    wavs_t = torch.tensor(wavs_np, dtype=torch.float32, device=rank)
+                    with torch.no_grad():
+                        wavlm_target = teachers["wavlm"](wavs_t).last_hidden_state.mean(dim=1)
+                        wh_inputs = teachers["whisper_extractor"](
+                            [w for w in wavs_np], sampling_rate=16000, return_tensors="pt"
+                        ).input_features.to(rank, non_blocking=True)
+                        whisper_target = teachers["whisper"](wh_inputs).last_hidden_state.mean(dim=1)
+
+                loss_wavlm = cosine_distillation_loss(s_wavlm_proj, wavlm_target) if wavlm_target is not None else torch.tensor(0.0, device=rank)
+                loss_whisper = cosine_distillation_loss(s_whisper_proj, whisper_target) if whisper_target is not None else torch.tensor(0.0, device=rank)
+                
+                input_lengths = torch.full((mels.size(0),), ctc_logits.size(1), dtype=torch.long, device=rank)
+                loss_ctc = ctc_loss_fn(
+                    ctc_logits.transpose(0, 1), batch["targets"].to(rank), 
+                    input_lengths, batch["target_lengths"].to(rank)
+                )
+                
+                loss_tier_c = truncation_margin_loss(norm_embed, trunc_embed)
+                loss_supcon, p_acc = supervised_contrastive_loss(norm_embed, batch["words"])
                 
                 if is_pretrain_phase:
-                    # STAGE 1: Pure Teacher Distillation + Phoneme CTC Alignment
-                    loss = ((WAVLM_DISTILL_WEIGHT * wavlm_loss) +
-                            (WHISPER_DISTILL_WEIGHT * whisper_loss) +
-                            (CTC_LOSS_WEIGHT * ctc_loss))
+                    loss = (WAVLM_DISTILL_WEIGHT * loss_wavlm) + (WHISPER_DISTILL_WEIGHT * loss_whisper) + (CTC_LOSS_WEIGHT * loss_ctc)
                 else:
-                    # STAGE 2: Full Prototypical + Tier C + Distillations
-                    loss = (proto_loss + 
-                            (TRUNCATION_AUX_WEIGHT * aux_loss) + 
-                            (WAVLM_DISTILL_WEIGHT * wavlm_loss) +
-                            (WHISPER_DISTILL_WEIGHT * whisper_loss) +
-                            (CTC_LOSS_WEIGHT * ctc_loss))
+                    loss = (loss_supcon + 
+                            (TRUNCATION_AUX_WEIGHT * loss_tier_c) + 
+                            (WAVLM_DISTILL_WEIGHT * loss_wavlm) + 
+                            (WHISPER_DISTILL_WEIGHT * loss_whisper) + 
+                            (CTC_LOSS_WEIGHT * loss_ctc))
                 
             scaler.scale(loss).backward()
             scaler.unscale_(optimizer)
@@ -151,20 +155,19 @@ def train(rank, world_size):
                 global_step = epoch * len(train_loader) + step
                 current_lr = scheduler.get_last_lr()[0]
                 writer.add_scalar("Loss/Total", loss.item(), global_step)
-                writer.add_scalar("Loss/Proto", proto_loss.item() if not is_pretrain_phase else 0.0, global_step)
-                writer.add_scalar("Loss/TierC_Truncation", aux_loss.item() if not is_pretrain_phase else 0.0, global_step)
-                writer.add_scalar("Loss/WavLM_Distill", wavlm_loss.item(), global_step)
-                writer.add_scalar("Loss/Whisper_Distill", whisper_loss.item(), global_step)
-                writer.add_scalar("Loss/Phoneme_CTC", ctc_loss.item(), global_step)
+                writer.add_scalar("Loss/Proto", loss_supcon.item() if not is_pretrain_phase else 0.0, global_step)
+                writer.add_scalar("Loss/TierC_Truncation", loss_tier_c.item() if not is_pretrain_phase else 0.0, global_step)
+                writer.add_scalar("Loss/WavLM_Distill", loss_wavlm.item(), global_step)
+                writer.add_scalar("Loss/Whisper_Distill", loss_whisper.item(), global_step)
+                writer.add_scalar("Loss/Phoneme_CTC", loss_ctc.item(), global_step)
                 writer.add_scalar("Train/Learning_Rate", current_lr, global_step)
-                writer.add_scalar("Accuracy/Proto", acc.item() if not is_pretrain_phase else 0.0, global_step)
+                writer.add_scalar("Accuracy/Proto", p_acc if not is_pretrain_phase else 0.0, global_step)
                 
         scheduler.step()
         
-        # Validation & Early Stopping Check (Rank 0)
         if rank == 0:
-            val_loss = loss.item() # Simulated validation metric
-            print(f"Epoch {epoch+1}/{EPOCHS} — Loss: {val_loss:.4f} {'(Pre-train Stage 1)' if is_pretrain_phase else '(Fine-tune Stage 2)'}")
+            val_loss = loss.item()
+            print(f"Epoch {epoch+1}/{EPOCHS} - Loss: {val_loss:.4f}")
             
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
@@ -176,13 +179,11 @@ def train(rank, world_size):
                     'scheduler_state_dict': scheduler.state_dict(),
                     'best_val_loss': best_val_loss,
                 }, os.path.join(OUTPUT_DIR, "best_sota_wakeword_model.pt"))
-                print(f"Saved new best model checkpoint with loss {best_val_loss:.4f}")
             else:
-                if not is_pretrain_phase: # Only apply early stopping during fine-tuning stage
+                if not is_pretrain_phase:
                     patience_counter += 1
-                    print(f"EarlyStopping counter: {patience_counter}/{EARLY_STOPPING_PATIENCE}")
                     if patience_counter >= EARLY_STOPPING_PATIENCE:
-                        print(f"Early stopping triggered! Model has not improved for {EARLY_STOPPING_PATIENCE} consecutive epochs.")
+                        print("Early stopping triggered!")
                         break
             
     cleanup()

@@ -93,7 +93,7 @@ def endpoint_utterance(stream_buffer: np.ndarray, sr: int,
     return out_wav
 
 def create_truncated_clip(wav: np.ndarray, sr: int) -> np.ndarray:
-    cut_ratio = np.random.uniform(0.60, 0.90)
+    cut_ratio = np.random.uniform(0.60, 0.85)
     cut_point = max(int(MIN_CLIP_SEC * sr), int(len(wav) * cut_ratio))
     truncated = wav[:cut_point]
     
@@ -179,8 +179,8 @@ def phonetic_distance(word1: str, word2: str) -> int:
 def generate_phonetic_minimal_pairs(phrase: str) -> list[str]:
     """
     SOTA Generative Voice Factory:
-    Algorithmically generates exact phonetic minimal pairs, prefix substitutions,
-    and suffix truncations for calibrating Stage 2 against false triggers.
+    Algorithmically generates hard negative minimal pairs using a Soundex-like
+    heuristic for calibrating Stage 2 against false triggers.
     """
     words = phrase.strip().split()
     if not words:
@@ -231,3 +231,30 @@ def slice_temporal_segments(wav: np.ndarray, num_segments: int = NUM_TEMPORAL_SE
         segments.append(seg)
         
     return segments
+
+def pad_or_trim(wav: np.ndarray, target_length: int) -> np.ndarray:
+    if len(wav) == target_length:
+        return wav
+    elif len(wav) > target_length:
+        start = (len(wav) - target_length) // 2
+        return wav[start:start + target_length]
+    else:
+        pad_needed = target_length - len(wav)
+        left = pad_needed // 2
+        return np.pad(wav, (left, pad_needed - left), mode='constant')
+
+def word_to_phoneme_tokens(word: str) -> list[int]:
+    word = re.sub(r'[^a-zA-Z]', '', word.upper())
+    tokens = []
+    i = 0
+    while i < len(word):
+        if i + 1 < len(word) and word[i:i+2] in PHONEME_MAP:
+            tokens.append(PHONEME_MAP[word[i:i+2]])
+            i += 2
+        elif word[i] in PHONEME_MAP:
+            tokens.append(PHONEME_MAP[word[i]])
+            i += 1
+        else:
+            tokens.append(PHONEME_MAP['<UNK>'])
+            i += 1
+    return tokens if tokens else [PHONEME_MAP['<UNK>']]

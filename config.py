@@ -46,9 +46,12 @@ MINIMAL_PAIR_NEGATIVE_COUNT = 12
 NUM_TEMPORAL_SEGMENTS = 3
 STAGE1_THRESHOLD = 0.60
 STAGE2_GLOBAL_THRESHOLD = 0.82
-SUFFIX_REJECTION_THRESHOLD = 0.65
+SUFFIX_REJECTION_THRESHOLD = 0.62          # Relaxed from 0.65 — reduces false rejects on fast speech
 CTC_POSTERIOR_THRESHOLD = 0.70
-DURATION_GATE_STD = 2.5
+# Duration gate — asymmetric: strict on short (catches truncations), lenient on long (allows slow speech)
+DURATION_GATE_STD_LOWER = 2.0              # Reject if duration < mean - 2.0*std  (tight — catches "Hey Karthik")
+DURATION_GATE_STD_UPPER = 3.5             # Allow if duration < mean + 3.5*std  (loose — allows slow speech)
+DURATION_GATE_STD = 2.5                   # Legacy fallback — kept for backward compat
 
 # Dataset Configuration & Optimal Sizing for Dual-Teacher
 MSWC_LANGUAGES = ["en"]
@@ -57,10 +60,8 @@ MSWC_MIN_CLIPS_PER_KEYWORD = 30                # Filters out noisy/rare words
 PHONETIC_HARD_NEGATIVE_RATIO = 0.6
 
 # Training & Optimization Parameters
-# Automatically adjust batch size if running on constrained local GPU (<= 4GB)
-_has_cuda = torch.cuda.is_available()
-_gpu_vram = torch.cuda.get_device_properties(0).total_memory / (1024**3) if _has_cuda else 0
-BATCH_SIZE = 16 if (_has_cuda and _gpu_vram <= 6) else 256
+# Defaulting to 128 to be safe across environments (T4s have 16GB). Adjust downward if OOM on <= 4GB GPUs.
+BATCH_SIZE = 128
 
 NUM_WORKERS = 4
 LEARNING_RATE = 5e-4                           # Optimal initial LR for AdamW + Distillation

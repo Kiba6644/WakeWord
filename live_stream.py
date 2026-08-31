@@ -152,14 +152,19 @@ class LiveWakeWordEngine:
                     log_mel = torch.log(torch.clamp(mel, min=1e-5))
                     feat = log_mel.transpose(1, 2).unsqueeze(0).numpy() # (1, 1, time, n_mels)
                     
-                    # Run Verification
+                    # Run Verification — pass raw buffer so cascade can VAD-measure real speech duration
                     triggered, metrics = self.cascade.verify_utterance(
-                        feat, duration_sec=1.2, ctc_suffix_prob=0.90
+                        feat, duration_sec=1.2,
+                        audio_buffer=audio_buffer, sr=self.sr,
+                        ctc_suffix_prob=0.90
                     )
                     
                     similarity = metrics.get("stage2_global_similarity", 0.0)
-                    # Convert cosine similarity (-1 to 1) into a probability percentage (0 to 100)
-                    prob = max(0.0, min(100.0, ((similarity + 1.0) / 2.0) * 100.0))
+                    suffix_sim = metrics.get("suffix_phase_similarity", 0.0)
+                    
+                    # Calibrate probability based on dynamic range (baseline floor ~0.85, target ~0.98)
+                    # Maps 0.80 -> 0%, 0.98 -> 100%
+                    prob = max(0.0, min(100.0, ((similarity - 0.80) / 0.18) * 100.0))
                     
                     # Visual Progress Bar
                     filled = int(prob / 5)
@@ -168,13 +173,16 @@ class LiveWakeWordEngine:
                     current_time = time.time()
                     if triggered and (current_time - last_trigger_time > 2.0):
                         last_trigger_time = current_time
-                        sys.stdout.write(f"\r\n\n🚨 [{bar}] {prob:.1f}% -> WAKE WORD DETECTED: '{self.phrase}'! 🚀\n\n")
+                        sys.stdout.write(f"\r\n\n🚨 [{bar}] {prob:.1f}% -> WAKE WORD DETECTED: '{self.phrase}'! 🚀\n   [Telemetry: CosSim={similarity:.4f} (Thresh={self.cascade.threshold2}), SuffixSim={suffix_sim:.4f}, Energy={db:.1f} dB]\n\n")
                         sys.stdout.flush()
                     else:
                         status = "Listening..." if prob < 60 else "Matching..."
+                        if metrics.get("near_miss"):
+                            status = f"⚡ Near-miss ({metrics.get('near_miss_stage', '?')})"
                         if "rejection_reason" in metrics:
                             status = metrics["rejection_reason"]
-                        sys.stdout.write(f"\r[ {bar} ] {prob:5.1f}%  ({status})    ")
+                        dur_str = f"{metrics.get('duration_sec_measured', metrics.get('duration_sec', 0.0)):.2f}s"
+                        sys.stdout.write(f"\r[ {bar} ] {prob:5.1f}% | Sim: {similarity:.4f} | Suf: {suffix_sim:.4f} | dB: {db:5.1f} | Dur: {dur_str} | ({status})    ")
                         sys.stdout.flush()
 
         except KeyboardInterrupt:
@@ -182,5 +190,8 @@ class LiveWakeWordEngine:
 
 if __name__ == "__main__":
     wake_phrase = sys.argv[1] if len(sys.argv) > 1 else "Hey Karthika"
+    thresh = float(sys.argv[2]) if len(sys.argv) > 2 else 0.96
     engine = LiveWakeWordEngine(phrase=wake_phrase)
+    engine.cascade.threshold2 = thresh
+    print(f"🔧 Configured Detection Threshold: {thresh}")
     engine.run_live_stream()

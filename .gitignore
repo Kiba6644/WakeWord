@@ -9,3 +9,9 @@ data/
 *.onnx
 .ipynb_checkpoints/
 desktop.ini
+wakeword_profile.json
+*.pt
+*.onnx
+noise/
+output/
+__pycache__/

@@ -1,5 +1,7 @@
 import numpy as np
 import pytest
+
+np.random.seed(42)
 from audio_utils import (endpoint_utterance, create_truncated_clip, 
                          time_stretch_audio, phonetic_distance, 
                          slice_temporal_segments, generate_phonetic_minimal_pairs)

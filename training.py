@@ -1,615 +1,134 @@
-"""
-SOTA Wake Word Engine — Self-Contained Complete Training Pipeline for Kaggle (2x T4 GPUs)
-========================================================================================
-Architecture:
-- Student: Depthwise-Separable CNN (DS-CNN) + Squeeze-and-Excitation + Multi-Head Attention Pooling
-- Teachers: microsoft/wavlm-large (1024D Phonetic) + openai/whisper-base (512D Robustness)
-- Losses: Prototypical Metric Loss + Tier C Truncation Margin + Dual Distillation + Phoneme CTC
-- Training Schedule: 2-Stage (5 Warmup Pretrain Epochs -> 45 Fine-Tuning Epochs with Early Stopping)
-- Export: Validated INT8 Dynamic Quantized ONNX (<1.5 MB)
-"""
-
 import os
-import sys
 import math
-import glob
-import random
-import re
 import argparse
-import logging
-from collections import defaultdict
-
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
-import torchaudio
-import torchaudio.transforms as T
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from torch.cuda.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import LambdaLR
 
-try:
-    from datasets import load_dataset
-except ImportError:
-    print("Please install datasets: pip install datasets")
+from config import (SR, WARMUP_EPOCHS, MIN_LR, GRAD_CLIP_NORM,
+                    TRUNCATION_AUX_WEIGHT, WAVLM_DISTILL_WEIGHT, 
+                    WHISPER_DISTILL_WEIGHT, CTC_LOSS_WEIGHT)
+from model import WakeWordModel
+from dataset import (MSWCTrainingDataset, collate_fn, load_speech_dataset, 
+                     load_background_noise_bank)
+from losses import truncation_margin_loss, cosine_distillation_loss, supervised_contrastive_loss
 
-try:
-    from transformers import WavLMModel, WhisperModel
-except ImportError:
-    print("Please install transformers: pip install transformers")
-
-try:
-    import onnx
-    import onnxruntime as ort
-    from onnxruntime.quantization import quantize_dynamic, QuantType
-except ImportError:
-    pass
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-logger = logging.getLogger(__name__)
-
-# =====================================================================
-# 1. AUDIO & ARCHITECTURE CONSTANTS
-# =====================================================================
-SR = 16000
-N_MELS = 40
-N_FFT = 400
-HOP_LENGTH = 160
-EMBED_DIM = 128
-
-STAGE1_CHANNELS = (16, 32, 32, 64)
-STAGE2_CHANNELS = (32, 64, 64, 128)
-NUM_ATTENTION_HEADS = 4
-NUM_PHONEMES = 42
-
-MAX_CLIP_SEC = 1.8
-MIN_CLIP_SEC = 0.4
-
-# Loss Weights
-TRUNCATION_AUX_WEIGHT = 0.3
-TRUNCATION_MARGIN = 0.8
-WAVLM_DISTILL_WEIGHT = 0.4
-WHISPER_DISTILL_WEIGHT = 0.3
-CTC_LOSS_WEIGHT = 0.3
-
-WAVLM_EMBED_DIM = 1024
-WHISPER_EMBED_DIM = 512
-
-TEMPO_AUG_FACTORS = (0.85, 1.0, 1.15, 1.25)
-WARMUP_EPOCHS = 5
-MIN_LR = 1e-5
-GRAD_CLIP_NORM = 1.0
-
-# Standard CMU-style Phoneme Index Mapping
-PHONEME_MAP = {
-    'AA': 1, 'AE': 2, 'AH': 3, 'AO': 4, 'AW': 5, 'AY': 6, 'B': 7, 'CH': 8, 'D': 9,
-    'DH': 10, 'EH': 11, 'ER': 12, 'EY': 13, 'F': 14, 'G': 15, 'HH': 16, 'IH': 17,
-    'IY': 18, 'JH': 19, 'K': 20, 'L': 21, 'M': 22, 'N': 23, 'NG': 24, 'OW': 25,
-    'OY': 26, 'P': 27, 'R': 28, 'S': 29, 'SH': 30, 'T': 31, 'TH': 32, 'UH': 33,
-    'UW': 34, 'V': 35, 'W': 36, 'Y': 37, 'Z': 38, 'ZH': 39, '<SIL>': 40, '<UNK>': 41
-}
-
-# =====================================================================
-# 2. AUDIO & PHONETIC UTILITIES
-# =====================================================================
-def time_stretch_audio(wav: np.ndarray, rate: float, sr: int = SR) -> np.ndarray:
-    """Time-stretch without pitch alteration via Overlap-Add."""
-    if abs(rate - 1.0) < 1e-3:
-        return wav.copy()
-    win_size = int(sr * 0.03)
-    hop_orig = win_size // 2
-    hop_new = int(hop_orig / rate)
-    if len(wav) < win_size * 2:
-        indices = np.linspace(0, len(wav) - 1, int(len(wav) / rate))
-        return np.interp(indices, np.arange(len(wav)), wav).astype(np.float32)
-    window = np.hanning(win_size)
-    num_frames = (len(wav) - win_size) // hop_orig
-    out_len = num_frames * hop_new + win_size
-    output = np.zeros(out_len, dtype=np.float32)
-    norm = np.zeros(out_len, dtype=np.float32)
-    for i in range(num_frames):
-        in_pos = i * hop_orig
-        out_pos = i * hop_new
-        frame = wav[in_pos:in_pos + win_size] * window
-        output[out_pos:out_pos + win_size] += frame
-        norm[out_pos:out_pos + win_size] += window
-    mask = norm > 1e-3
-    output[mask] /= norm[mask]
-    return output
-
-def create_truncated_clip(wav: np.ndarray, sr: int = SR) -> np.ndarray:
-    """Tier C synthetic truncation: cuts between 60%-85% duration."""
-    cut_ratio = np.random.uniform(0.60, 0.85)
-    cut_point = max(int(MIN_CLIP_SEC * sr), int(len(wav) * cut_ratio))
-    truncated = wav[:cut_point]
-    min_samples = int(MIN_CLIP_SEC * sr)
-    if len(truncated) < min_samples:
-        truncated = np.pad(truncated, (0, min_samples - len(truncated)), mode='constant')
-    return truncated
-
-def pad_or_trim(wav: np.ndarray, target_length: int) -> np.ndarray:
-    """Safely pads or center-crops audio to target length."""
-    if len(wav) == target_length:
-        return wav
-    elif len(wav) > target_length:
-        start = (len(wav) - target_length) // 2
-        return wav[start:start + target_length]
-    else:
-        pad_needed = target_length - len(wav)
-        left = pad_needed // 2
-        return np.pad(wav, (left, pad_needed - left), mode='constant')
-
-def word_to_phoneme_tokens(word: str) -> list[int]:
-    """Converts a word into approximate phoneme index targets for CTC training."""
-    word = re.sub(r'[^a-zA-Z]', '', word.upper())
-    tokens = []
-    i = 0
-    while i < len(word):
-        if i + 1 < len(word) and word[i:i+2] in PHONEME_MAP:
-            tokens.append(PHONEME_MAP[word[i:i+2]])
-            i += 2
-        elif word[i] in PHONEME_MAP:
-            tokens.append(PHONEME_MAP[word[i]])
-            i += 1
-        else:
-            tokens.append(PHONEME_MAP['<UNK>'])
-            i += 1
-    return tokens if tokens else [PHONEME_MAP['<UNK>']]
-
-def load_background_noise_bank(noise_dir: str) -> list[np.ndarray]:
-    """Directly loads background noise audio files from the specified hardcoded directory."""
-    if not noise_dir or not os.path.exists(noise_dir):
-        print(f"ℹ️ Background noise directory '{noise_dir}' not found. Using synthetic noise augmentation.")
-        return []
-        
-    wav_files = glob.glob(os.path.join(noise_dir, "*.wav"))
-    noise_clips = []
-    for p in wav_files:
-        try:
-            w, in_sr = torchaudio.load(p)
-            if w.shape[0] > 1:
-                w = w.mean(dim=0, keepdim=True)
-            if in_sr != SR:
-                w = torchaudio.functional.resample(w, in_sr, SR)
-            noise_clips.append(w.squeeze(0).numpy())
-        except Exception:
-            pass
-            
-    print(f"🔊 Loaded {len(noise_clips)} background noise files directly from: {noise_dir}")
-    return noise_clips
-
-# =====================================================================
-# 3. STUDENT MODEL ARCHITECTURE
-# =====================================================================
-class SqueezeExcitation(nn.Module):
-    def __init__(self, channels, reduction=4):
-        super().__init__()
-        self.fc = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(channels, channels // reduction, bias=False),
-            nn.SiLU(inplace=True),
-            nn.Linear(channels // reduction, channels, bias=False),
-            nn.Sigmoid()
-        )
-
-    def forward(self, x):
-        b, c, _, _ = x.shape
-        w = self.fc(x).view(b, c, 1, 1)
-        return x * w
-
-class DepthwiseSeparableConv(nn.Module):
-    def __init__(self, in_ch, out_ch, kernel_size, stride=1, padding=0):
-        super().__init__()
-        self.depthwise = nn.Conv2d(in_ch, in_ch, kernel_size=kernel_size, 
-                                   stride=stride, padding=padding, groups=in_ch, bias=False)
-        self.pointwise = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
-        self.bn = nn.BatchNorm2d(out_ch)
-        self.silu = nn.SiLU(inplace=True)
-        self.se = SqueezeExcitation(out_ch)
-
-    def forward(self, x):
-        x = self.depthwise(x)
-        x = self.pointwise(x)
-        x = self.bn(x)
-        x = self.silu(x)
-        x = self.se(x)
-        return x
-
-class DSCNNEncoder(nn.Module):
-    def __init__(self, in_channels=1, channels=(32, 64, 64, 128)):
-        super().__init__()
-        self.init_conv = nn.Sequential(
-            nn.Conv2d(in_channels, channels[0], kernel_size=(10, 4), stride=(2, 2), padding=(4, 1), bias=False),
-            nn.BatchNorm2d(channels[0]),
-            nn.SiLU(inplace=True)
-        )
-        blocks = []
-        in_ch = channels[0]
-        for out_ch in channels[1:]:
-            blocks.append(DepthwiseSeparableConv(in_ch, out_ch, kernel_size=(3, 3), padding=(1, 1)))
-            in_ch = out_ch
-        self.blocks = nn.Sequential(*blocks)
-
-    def forward(self, x):
-        x = self.init_conv(x)
-        x = self.blocks(x)
-        return x
-
-class MultiHeadAttentionPooling(nn.Module):
-    def __init__(self, in_dim, embed_dim, num_heads=NUM_ATTENTION_HEADS):
-        super().__init__()
-        self.num_heads = num_heads
-        self.query_tokens = nn.Parameter(torch.empty(num_heads, in_dim))
-        nn.init.normal_(self.query_tokens, mean=0.0, std=0.02)
-        
-        self.key_proj = nn.Linear(in_dim, in_dim, bias=False)
-        self.val_proj = nn.Linear(in_dim, in_dim, bias=False)
-        self.out_proj = nn.Linear(num_heads * in_dim, embed_dim)
-        self.layer_norm = nn.LayerNorm(embed_dim)
-
-    def forward(self, x, mask=None):
-        b, t, d = x.shape
-        keys = self.key_proj(x)
-        vals = self.val_proj(x)
-        
-        q = self.query_tokens.unsqueeze(0).expand(b, -1, -1)
-        scores = torch.bmm(q, keys.transpose(1, 2)) / (d ** 0.5)
-        
-        if mask is not None:
-            # mask: (B, T) boolean. True means valid frame.
-            mask = mask.unsqueeze(1).expand(-1, self.num_heads, -1)
-            scores = scores.masked_fill(~mask, float('-inf'))
-            
-        attn_weights = F.softmax(scores, dim=-1)
-        attn_weights = torch.nan_to_num(attn_weights) # safe fallback if all masked
-        
-        pooled = torch.bmm(attn_weights, vals)
-        pooled = pooled.reshape(b, -1)
-        out = self.out_proj(pooled)
-        out = self.layer_norm(out)
-        return out
-
-class WakeWordModel(nn.Module):
-    def __init__(self, channels=STAGE2_CHANNELS, temporal_head="attention", embed_dim=EMBED_DIM):
-        super().__init__()
-        self.encoder = DSCNNEncoder(in_channels=1, channels=channels)
-        self.temporal_head_type = temporal_head
-        
-        if temporal_head == "attention":
-            self.temporal = MultiHeadAttentionPooling(channels[-1], embed_dim)
-        elif temporal_head == "gru":
-            self.gru = nn.GRU(channels[-1], embed_dim, batch_first=True)
-        else:
-            self.pool = nn.AdaptiveAvgPool1d(1)
-            self.fc = nn.Linear(channels[-1], embed_dim)
-
-        self.distill_wavlm_proj = nn.Sequential(
-            nn.Linear(embed_dim, 512),
-            nn.SiLU(inplace=True),
-            nn.Linear(512, WAVLM_EMBED_DIM)
-        )
-        self.distill_whisper_proj = nn.Sequential(
-            nn.Linear(embed_dim, 256),
-            nn.SiLU(inplace=True),
-            nn.Linear(256, WHISPER_EMBED_DIM)
-        )
-        self.ctc_head = nn.Sequential(
-            nn.Linear(channels[-1], channels[-1] // 2),
-            nn.SiLU(inplace=True),
-            nn.Linear(channels[-1] // 2, NUM_PHONEMES),
-            nn.LogSoftmax(dim=-1)
-        )
-
-    def extract_time_features(self, x):
-        if x.ndim == 3:
-            x = x.unsqueeze(1)
-        feat = self.encoder(x)
-        feat = feat.mean(dim=-1)
-        feat = feat.transpose(1, 2)
-        return feat
-
-    def forward(self, x, mask=None, return_distill=False, return_ctc=False):
-        feat = self.extract_time_features(x)
-        
-        if self.temporal_head_type == "attention":
-            if mask is not None:
-                # Downsample mask to match CNN time dimension (stride=2 in first layer)
-                mask_float = mask.float().unsqueeze(1)
-                mask_down = F.adaptive_max_pool1d(mask_float, output_size=feat.size(1)).squeeze(1)
-                bool_mask = mask_down > 0.5
-            else:
-                bool_mask = None
-            embed = self.temporal(feat, mask=bool_mask)
-        elif self.temporal_head_type == "gru":
-            out, _ = self.gru(feat)
-            embed = out[:, -1, :]
-        else:
-            pooled = self.pool(feat.transpose(1, 2)).squeeze(-1)
-            embed = self.fc(pooled)
-            
-        norm_embed = F.normalize(embed, p=2, dim=-1)
-        ctc_logits = self.ctc_head(feat) if (return_ctc or return_distill) else None
-        
-        if return_distill:
-            wavlm_proj = self.distill_wavlm_proj(norm_embed)
-            whisper_proj = self.distill_whisper_proj(norm_embed)
-            return norm_embed, (wavlm_proj, whisper_proj), ctc_logits
-            
-        if return_ctc:
-            return norm_embed, ctc_logits
-            
-        return norm_embed
-
-def load_speech_dataset(mswc_split: str, dataset_path: str = None):
-    """
-    Loads MSWC (Multilingual Spoken Words Corpus) English dataset.
-    If dataset_path is provided and exists, loads directly from disk in seconds.
-    """
-    if dataset_path and os.path.exists(dataset_path):
-        print(f"⚡ Loading pre-processed MSWC dataset directly from disk: {dataset_path}")
-        from datasets import load_from_disk
-        return load_from_disk(dataset_path)
-
-    print(f"Loading primary MSWC English dataset ({mswc_split})...")
-    try:
-        ds = load_dataset("MLCommons/ml_spoken_words", "en_opus", split=mswc_split, trust_remote_code=True)
-        print(f"✅ Successfully loaded MSWC dataset ({len(ds)} audio samples)!")
-        return ds
-    except Exception as e:
-        raise RuntimeError(
-            f"Failed to load MSWC dataset: {e}\n"
-            f"Fix: Ensure you have 'datasets < 3.0.0' installed (e.g. `pip install \"datasets<3.0.0\"`) and Internet access is ON."
-        )
-
-# =====================================================================
-# 4. DATASET & FRONTEND
-# =====================================================================
-class MSWCTrainingDataset(Dataset):
-    def __init__(self, hf_dataset, noise_clips=None, target_sec=1.2, teacher_targets=None, indices=None):
-        self.dataset = hf_dataset
-        self.noise_clips = noise_clips or []
-        self.target_samples = int(target_sec * SR)
-        self.teacher_targets = teacher_targets
-        self.indices = indices # Maps dataset subset index back to full dataset index if split
-        self.mel_transform = T.MelSpectrogram(
-            sample_rate=SR, n_fft=N_FFT, hop_length=HOP_LENGTH, n_mels=N_MELS, power=2.0
-        )
-
-    def __len__(self):
-        return len(self.dataset)
-
-    def __getitem__(self, idx):
-        item = self.dataset[idx]
-        raw_audio = item["audio"]["array"]
-        in_sr = item["audio"]["sampling_rate"]
-        
-        # Resolve word label safely across MSWC, Google Speech Commands, and AudioFolder
-        word = item.get("word")
-        if not word and "label" in item:
-            val = item["label"]
-            if isinstance(val, str):
-                word = val
-            elif hasattr(self.dataset, "features") and "label" in self.dataset.features:
-                try:
-                    word = self.dataset.features["label"].int2str(val)
-                except Exception:
-                    word = str(val)
-            else:
-                word = str(val)
-        word = str(word) if word else "unknown"
-
-        wav_t = torch.tensor(raw_audio, dtype=torch.float32)
+def _fast_cache_collate(batch):
+    import torch
+    import torchaudio
+    import numpy as np
+    from audio_utils import pad_or_trim
+    from config import SR
+    
+    target_samples = int(1.2 * SR)
+    wavs = []
+    for item in batch:
+        audio = item["audio"]
+        wav_t = torch.tensor(audio["array"], dtype=torch.float32)
+        in_sr = audio["sampling_rate"]
         if in_sr != SR:
             wav_t = torchaudio.functional.resample(wav_t, in_sr, SR)
-            
-        wav = wav_t.numpy()
-
-        if random.random() < 0.5:
-            rate = random.choice(TEMPO_AUG_FACTORS)
-            wav = time_stretch_audio(wav, rate, SR)
-
-        if self.noise_clips and random.random() < 0.6:
-            noise = random.choice(self.noise_clips)
-            if len(noise) > len(wav):
-                start = random.randint(0, len(noise) - len(wav))
-                noise_seg = noise[start:start + len(wav)]
-            else:
-                noise_seg = np.pad(noise, (0, len(wav) - len(noise)), mode='wrap')
-                
-            snr = random.uniform(5.0, 20.0)
-            sig_power = np.sum(wav**2) + 1e-8
-            noise_power = np.sum(noise_seg**2) + 1e-8
-            scale = np.sqrt(sig_power / (noise_power * (10**(snr / 10.0))))
-            wav = wav + noise_seg * scale
-
-        wav = pad_or_trim(wav, self.target_samples)
-        trunc_wav = create_truncated_clip(wav, SR)
-        trunc_wav = pad_or_trim(trunc_wav, self.target_samples)
-
-        wav_tensor = torch.tensor(wav, dtype=torch.float32).unsqueeze(0)
-        trunc_tensor = torch.tensor(trunc_wav, dtype=torch.float32).unsqueeze(0)
-
-        mel = self.mel_transform(wav_tensor)
-        trunc_mel = self.mel_transform(trunc_tensor)
-
-        log_mel = torch.log(torch.clamp(mel, min=1e-5))
-        trunc_log_mel = torch.log(torch.clamp(trunc_mel, min=1e-5))
-        phoneme_tokens = word_to_phoneme_tokens(word)
-
-        res = {
-            "wav": wav,
-            "mel": log_mel,
-            "trunc_mel": trunc_log_mel,
-            "word": word,
-            "phoneme_tokens": torch.tensor(phoneme_tokens, dtype=torch.long)
-        }
+        wavs.append(pad_or_trim(wav_t.numpy(), target_samples))
         
-        if self.teacher_targets is not None:
-            actual_idx = self.indices[idx] if self.indices is not None else idx
-            res["wavlm_target"] = self.teacher_targets["wavlm"][actual_idx]
-            res["whisper_target"] = self.teacher_targets["whisper"][actual_idx]
-            
-        return res
+    return torch.tensor(np.stack(wavs, axis=0), dtype=torch.float16)
 
-def collate_fn(batch):
-    mels = torch.stack([b["mel"] for b in batch], dim=0).transpose(2, 3)
-    trunc_mels = torch.stack([b["trunc_mel"] for b in batch], dim=0).transpose(2, 3)
-    wavs = [b["wav"] for b in batch]
-    words = [b["word"] for b in batch]
-    tokens = [b["phoneme_tokens"] for b in batch]
-    target_lengths = torch.tensor([len(t) for t in tokens], dtype=torch.long)
-    targets = torch.cat(tokens, dim=0)
-    
-    res = {
-        "mels": mels,
-        "trunc_mels": trunc_mels,
-        "wavs": wavs,
-        "words": words,
-        "targets": targets,
-        "target_lengths": target_lengths
-    }
-    
-    if "wavlm_target" in batch[0]:
-        res["wavlm_targets"] = torch.stack([b["wavlm_target"] for b in batch], dim=0)
-        res["whisper_targets"] = torch.stack([b["whisper_target"] for b in batch], dim=0)
-        
-    return res
 
-# =====================================================================
-# 5. LOSS FUNCTIONS
-# =====================================================================
-def truncation_margin_loss(embed_full, embed_truncated, margin=TRUNCATION_MARGIN):
-    diff = embed_full - embed_truncated
-    dist = torch.sqrt(torch.sum(diff ** 2, dim=-1) + 1e-8)
-    return F.relu(margin - dist).mean()
-
-def cosine_distillation_loss(student_proj, teacher_embed):
-    s_norm = F.normalize(student_proj, p=2, dim=-1)
-    t_norm = F.normalize(teacher_embed, p=2, dim=-1)
-    return (1.0 - (s_norm * t_norm).sum(dim=-1)).mean()
-
-def supervised_contrastive_loss(embeds, words, temperature=0.1):
+def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device, batch_size=512):
     """
-    SOTA Supervised Contrastive Loss + Uniformity Fallback.
-    Forces embeddings of the same word together, and different words apart.
-    Shatters dimensional collapse / anisotropy to ensure random words have ~0.10 similarity.
+    Max-speed 1-pass teacher embedding cache.
+    
+    Optimizations:
+    1. DataLoader with num_workers > 0 (Parallel background Opus decoding & padding)
+    2. FP16 Inference (.half()) (2x faster matrix multiplies on Tensor Cores, half VRAM)
+    3. Pinned Memory (Fast CPU->GPU transfers)
+    4. Batched numpy processing for Whisper feature extraction
     """
-    device = embeds.device
-    B = embeds.shape[0]
-    
-    # Normalize (should already be normalized, but safe)
-    embeds = F.normalize(embeds, p=2, dim=-1)
-    
-    # Cosine similarity matrix
-    sim_matrix = torch.matmul(embeds, embeds.T) / temperature
-    
-    # Numerical stability
-    sim_max, _ = torch.max(sim_matrix, dim=1, keepdim=True)
-    logits = sim_matrix - sim_max.detach()
-    
-    # Mask of positives (1 if same word)
-    labels = np.array(words)
-    mask = torch.tensor(labels[:, None] == labels[None, :], dtype=torch.float32, device=device)
-    
-    # Remove self-contrast
-    logits_mask = torch.scatter(torch.ones_like(mask), 1, torch.arange(B, device=device).view(-1, 1), 0)
-    mask = mask * logits_mask
-    
-    # Compute log_prob
-    exp_logits = torch.exp(logits) * logits_mask
-    log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8)
-    
-    # Mean of log-likelihood over positives
-    mask_sum = mask.sum(1)
-    valid_mask = mask_sum > 0
-    
-    if not valid_mask.any():
-        # Fallback: Uniformity Loss (pushes all distinct clips apart to prevent collapse)
-        sq_dist = torch.pdist(embeds, p=2).pow(2)
-        return torch.log(torch.mean(torch.exp(-2.0 * sq_dist))), 0.0
-        
-    mean_log_prob_pos = (mask * log_prob).sum(1)[valid_mask] / mask_sum[valid_mask]
-    loss = -mean_log_prob_pos.mean()
-    
-    # Accuracy calculation for tracking
-    sim_matrix.fill_diagonal_(-1e9)
-    top1_idx = sim_matrix.argmax(dim=1)
-    top1_is_pos = mask[torch.arange(B), top1_idx]
-    acc = top1_is_pos[valid_mask].mean().item()
-    
-    return loss, acc
+    import time
+    import os
+    import torch
+    from torch.utils.data import DataLoader
+    from transformers import WavLMModel, WhisperModel, WhisperFeatureExtractor
+    from config import SR
 
-def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device, batch_size=256):
-    print(f"\n⚡ Pre-extracting Teacher Embeddings (1-Pass Caching for 10x Training Speedup)...")
-    
-    print(f"  • Loading WavLM ({wavlm_model_name})...")
-    wavlm = WavLMModel.from_pretrained(wavlm_model_name).to(device)
+    print(f"\n⚡ Pre-extracting Teacher Embeddings (Max Speed: DataLoader + FP16)...")
+    print(f"  • WavLM  : {wavlm_model_name}")
+    print(f"  • Whisper: {whisper_model_name}")
+    print(f"  • Samples: {len(ds):,}   Batch: {batch_size}   Device: {device}")
+
+    # 1. Load models in FP16 for massive speedup
+    wavlm = WavLMModel.from_pretrained(wavlm_model_name).to(device).half()
     wavlm.eval()
     for p in wavlm.parameters(): p.requires_grad = False
-    
-    print(f"  • Loading Whisper ({whisper_model_name})...")
-    from transformers import WhisperFeatureExtractor
+
     whisper_extractor = WhisperFeatureExtractor.from_pretrained(whisper_model_name)
-    whisper = WhisperModel.from_pretrained(whisper_model_name).encoder.to(device)
+    whisper = WhisperModel.from_pretrained(whisper_model_name).encoder.to(device).half()
     whisper.eval()
     for p in whisper.parameters(): p.requires_grad = False
-    
+
+    # 2. Parallel Background Collate
+    workers = min(8, os.cpu_count() or 4)
+    loader = DataLoader(
+        ds, 
+        batch_size=batch_size, 
+        collate_fn=_fast_cache_collate, 
+        num_workers=workers, 
+        pin_memory=True, 
+        shuffle=False
+    )
+
     wavlm_targets = []
     whisper_targets = []
-    
     num_samples = len(ds)
-    target_samples = int(1.2 * SR)
-    
-    with torch.no_grad(), autocast():
-        for i in range(0, num_samples, batch_size):
-            end_idx = min(i + batch_size, num_samples)
-            batch_items = [ds[j] for j in range(i, end_idx)]
-            wavs_list = []
-            for item in batch_items:
-                raw_audio = item["audio"]["array"]
-                in_sr = item["audio"]["sampling_rate"]
-                wav_t = torch.tensor(raw_audio, dtype=torch.float32)
-                if in_sr != SR:
-                    wav_t = torchaudio.functional.resample(wav_t, in_sr, SR)
-                wav = pad_or_trim(wav_t.numpy(), target_samples)
-                wavs_list.append(wav)
-                
-            wavs_np = np.stack(wavs_list, axis=0)
-            wavs_t = torch.tensor(wavs_np, dtype=torch.float32, device=device)
+    t_start = time.time()
+
+    with torch.no_grad():
+        for batch_idx, wavs_t in enumerate(loader):
+            wavs_t = wavs_t.to(device, non_blocking=True)
             
-            # WavLM
+            # WavLM Inference (FP16)
             w_out = wavlm(wavs_t).last_hidden_state.mean(dim=1).cpu()
             wavlm_targets.append(w_out)
             
-            # Whisper
-            wh_inputs = whisper_extractor([w for w in wavs_np], sampling_rate=SR, return_tensors="pt").input_features.to(device)
+            # Whisper Inference (FP16)
+            wavs_np = wavs_t.cpu().float().numpy()  # Extractor needs FP32 numpy
+            wh_inputs = whisper_extractor(list(wavs_np), sampling_rate=SR, return_tensors="pt").input_features
+            wh_inputs = wh_inputs.to(device, non_blocking=True).half()
+            
             wh_out = whisper(wh_inputs).last_hidden_state.mean(dim=1).cpu()
             whisper_targets.append(wh_out)
             
-            if ((i // batch_size) + 1) % 10 == 0 or end_idx == num_samples:
-                print(f"  ✓ Cached {end_idx}/{num_samples} samples...")
-                
-    wavlm_all = torch.cat(wavlm_targets, dim=0)
-    whisper_all = torch.cat(whisper_targets, dim=0)
-    
-    mem_size = wavlm_all.element_size() * (wavlm_all.nelement() + whisper_all.nelement()) / 1e6
-    print(f"✅ Teacher Feature Extraction Complete! Cached {num_samples} targets in RAM ({mem_size:.1f} MB).")
-    
-    # Unload teachers completely to free 100% VRAM for student model
+            # Progress + ETA
+            samples_done = min((batch_idx + 1) * batch_size, num_samples)
+            if (batch_idx + 1) % 2 == 0 or samples_done == num_samples:
+                elapsed = time.time() - t_start
+                rate = samples_done / elapsed
+                remaining = (num_samples - samples_done) / rate if rate > 0 else 0
+                print(f"  ✓ {samples_done:>7,}/{num_samples:,}  "
+                      f"[{elapsed:5.0f}s elapsed | ETA {remaining:5.0f}s | "
+                      f"{rate:6.1f} samples/s]")
+
+    # Return to FP32 to match expected model/loss output types
+    wavlm_all = torch.cat(wavlm_targets, dim=0).float()
+    whisper_all = torch.cat(whisper_targets, dim=0).float()
+
+    mem_mb = (wavlm_all.element_size() * wavlm_all.nelement() +
+              whisper_all.element_size() * whisper_all.nelement()) / 1e6
+    total_elapsed = time.time() - t_start
+    print(f"✅ Caching complete — {num_samples:,} samples in {total_elapsed:.1f}s "
+          f"({num_samples/total_elapsed:.0f} samples/s) | RAM: {mem_mb:.1f} MB")
+
     del wavlm, whisper, whisper_extractor
     import gc
     gc.collect()
     torch.cuda.empty_cache()
-    
+
     return {"wavlm": wavlm_all, "whisper": whisper_all}
 
-# =====================================================================
-# 6. MAIN EXECUTION PIPELINE
-# =====================================================================
 def run_training(
-    noise_dir: str = "/kaggle/input/datasets/neehakurelli/google-speech-commands/_background_noise_",
+    noise_dir: str = "./noise",
     output_dir: str = "./output",
     dataset_path: str = None,
     resume_path: str = None,
@@ -626,25 +145,9 @@ def run_training(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(output_dir, exist_ok=True)
     
-    print(f"\n=======================================================")
-    print(f"🚀 Starting SOTA Wake Word Training Pipeline on: {device}")
-    print(f"=======================================================")
-    print(f"  • Noise Directory:       {noise_dir}")
-    print(f"  • Output Directory:      {output_dir}")
-    print(f"  • MSWC Split:            {mswc_split}")
-    print(f"  • Dataset Path:          {dataset_path or 'Online Download'}")
-    print(f"  • Resume Checkpoint:     {resume_path or 'Auto-Detect'}")
-    print(f"  • Teacher Caching:       {'ENABLED (10x Speedup)' if cache_teachers else 'Disabled'}")
-    print(f"  • Batch Size:            {batch_size}")
-    print(f"  • Max Epochs:            {epochs}")
-    print(f"  • Learning Rate:         {lr}")
-    print(f"  • Early Stopping:        {early_stopping_patience} epochs\n")
-    
-    # 1. Load Datasets
     ds = load_speech_dataset(mswc_split, dataset_path=dataset_path)
     noise_bank = load_background_noise_bank(noise_dir)
     
-    # 2. 1-Pass Fast Teacher Extraction Caching
     teacher_targets = None
     if cache_teachers:
         teacher_targets = precompute_teacher_features(ds, wavlm_model, whisper_model, device, batch_size=256)
@@ -657,33 +160,27 @@ def run_training(
     
     train_loader = DataLoader(
         MSWCTrainingDataset(train_ds, noise_clips=noise_bank, teacher_targets=teacher_targets, indices=train_ds.indices if teacher_targets else None),
-        batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True
+        batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True
     )
     val_loader = DataLoader(
         MSWCTrainingDataset(val_ds, noise_clips=noise_bank, teacher_targets=teacher_targets, indices=val_ds.indices if teacher_targets else None),
-        batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True
+        batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True
     )
-    print(f"Dataset Ready: {len(train_ds)} train clips, {len(val_ds)} val clips.")
     
-    # 3. Load Student Model
     student = WakeWordModel().to(device)
-    print(f"Student Model Parameters: {sum(p.numel() for p in student.parameters() if p.requires_grad):,}")
     
     wavlm, whisper, whisper_extractor = None, None, None
     if not cache_teachers:
-        print(f"Loading WavLM Teacher ({wavlm_model})...")
+        from transformers import WavLMModel, WhisperModel, WhisperFeatureExtractor
         wavlm = WavLMModel.from_pretrained(wavlm_model).to(device)
         wavlm.eval()
         for p in wavlm.parameters(): p.requires_grad = False
         
-        print(f"Loading Whisper Teacher ({whisper_model})...")
-        from transformers import WhisperFeatureExtractor
         whisper_extractor = WhisperFeatureExtractor.from_pretrained(whisper_model)
         whisper = WhisperModel.from_pretrained(whisper_model).encoder.to(device)
         whisper.eval()
         for p in whisper.parameters(): p.requires_grad = False
     
-    # 4. Optimizers
     optimizer = torch.optim.AdamW(student.parameters(), lr=lr, weight_decay=weight_decay)
     
     def lr_lambda(epoch):
@@ -700,26 +197,19 @@ def run_training(
     patience = 0
     start_epoch = 0
 
-    # Auto-detect or load resume checkpoint
     target_resume = resume_path or os.path.join(output_dir, "best_sota_wakeword_model.pt")
     if os.path.exists(target_resume):
-        print(f"🔄 Checkpoint found at '{target_resume}'! Resuming training state...")
         checkpoint = torch.load(target_resume, map_location=device)
         student.load_state_dict(checkpoint['model_state_dict'])
         if 'epoch' in checkpoint:
             start_epoch = checkpoint['epoch'] + 1
-            print(f"   ✓ Successfully resumed! Starting from Epoch {start_epoch + 1}/{epochs}")
         if 'val_metric' in checkpoint:
             best_val_loss = checkpoint['val_metric']
-            print(f"   ✓ Best validation loss restored: {best_val_loss:.4f}")
     
-    # 5. Training Loop
     for epoch in range(start_epoch, epochs):
         student.train()
-        is_pretrain = (epoch < 5) # First 5 epochs warmup
+        is_pretrain = (epoch < 5)
         total_epoch_loss = 0.0
-        
-        print(f"\n--- Epoch {epoch+1}/{epochs} {'[Stage 1: Teacher Alignment]' if is_pretrain else '[Stage 2: Metric Fine-Tuning]'} ---")
         
         for step, batch in enumerate(train_loader):
             optimizer.zero_grad(set_to_none=True)
@@ -729,8 +219,7 @@ def run_training(
             wavs_np = np.stack(batch["wavs"], axis=0)
             wavs_t = torch.tensor(wavs_np, dtype=torch.float32, device=device)
             
-            # Compute energy mask to ignore silence padding (-9.2 is approx log(1e-4))
-            energy = mels.mean(dim=-1).squeeze(1) # (B, T)
+            energy = mels.mean(dim=-1).squeeze(1)
             attention_mask = energy > -10.0
             
             if "wavlm_targets" in batch:
@@ -780,12 +269,11 @@ def run_training(
             total_epoch_loss += loss.item()
             
             if step % 25 == 0:
-                print(f"Step {step:03d} | Loss: {loss.item():.4f} | Distill: {(loss_wavlm+loss_whisper).item():.3f} | TierC: {loss_tier_c.item():.3f} | Proto: {loss_proto.item():.3f}")
+                print(f"Step {step:03d} | Loss: {loss.item():.4f} | Distill: {(loss_wavlm+loss_whisper).item():.3f} | TierC: {loss_tier_c.item():.3f} | Proto: {loss_supcon.item():.3f}")
                 
         scheduler.step()
         avg_train_loss = total_epoch_loss / len(train_loader)
         
-        # Validation & Early Stopping
         student.eval()
         val_trunc_loss = 0.0
         val_supcon_loss = 0.0
@@ -806,9 +294,10 @@ def run_training(
                 val_supcon_loss += p_loss.item()
                 val_batches += 1
                 
-        val_trunc_loss /= val_batches
-        val_supcon_loss /= val_batches
-        val_combined = val_trunc_loss + val_supcon_loss # We want to minimize both
+        if val_batches > 0:
+            val_trunc_loss /= val_batches
+            val_supcon_loss /= val_batches
+        val_combined = val_trunc_loss + val_supcon_loss
         
         print(f"Epoch {epoch+1} Done | Train Loss: {avg_train_loss:.4f} | Val Trunc: {val_trunc_loss:.4f} | Val SupCon: {val_supcon_loss:.4f}")
         
@@ -820,23 +309,17 @@ def run_training(
                 'model_state_dict': student.state_dict(),
                 'val_metric': best_val_loss
             }, os.path.join(output_dir, "best_sota_wakeword_model.pt"))
-            print(f"⭐ New Best Model Saved (Val Loss: {best_val_loss:.4f})")
         else:
             if not is_pretrain:
                 patience += 1
-                print(f"EarlyStopping Counter: {patience}/{early_stopping_patience}")
                 if patience >= early_stopping_patience:
-                    print(f"🛑 Early stopping triggered after {early_stopping_patience} stagnant epochs!")
                     break
                     
-    # ==========================================
-    # 6. EXPORT INT8 ONNX MODEL
-    # ==========================================
-    print("\n--- Exporting Production INT8 ONNX Model ---")
+    print("Exporting ONNX...")
     student.load_state_dict(torch.load(os.path.join(output_dir, "best_sota_wakeword_model.pt"), map_location=device)['model_state_dict'])
     student.eval()
     
-    dummy_input = torch.randn(1, 1, int(1.2 * SR / HOP_LENGTH), 40).to(device)
+    dummy_input = torch.randn(1, 1, int(1.2 * SR / 160), 40).to(device)
     onnx_path = os.path.join(output_dir, "wakeword_student.onnx")
     
     try:
@@ -846,27 +329,16 @@ def run_training(
             input_names=['input_mel'], output_names=['embedding'],
             dynamic_axes={'input_mel': {0: 'batch_size', 2: 'time'}, 'embedding': {0: 'batch_size'}}
         )
-        print(f"✅ ONNX Exported: {onnx_path}")
-        
-        try:
-            import onnx
-            from onnxruntime.quantization import quantize_dynamic, QuantType
-            quant_onnx_path = os.path.join(output_dir, "wakeword_student_int8.onnx")
-            quantize_dynamic(onnx_path, quant_onnx_path, weight_type=QuantType.QUInt8)
-            print(f"✅ INT8 ONNX Exported: {quant_onnx_path}")
-        except ImportError:
-            print("⚠️ 'onnxruntime' not found. Skipping INT8 quantization.")
-            
+        print(f"ONNX Exported: {onnx_path}")
     except Exception as e:
-        print(f"⚠️ ONNX Export failed: {e}")
-        print("💡 Tip: Run `!pip install onnxscript onnx onnxruntime` in your Kaggle notebook.")
+        print(f"ONNX Export failed: {e}")
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Train SOTA Wake Word Engine")
-    parser.add_argument("--noise_dir", type=str, default="/kaggle/input/datasets/neehakurelli/google-speech-commands/_background_noise_")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--noise_dir", type=str, default="./noise")
     parser.add_argument("--output_dir", type=str, default="./output")
-    parser.add_argument("--dataset_path", type=str, default=None, help="Path to pre-processed local dataset directory")
-    parser.add_argument("--resume_path", type=str, default=None, help="Path to checkpoint .pt file to resume training from")
+    parser.add_argument("--dataset_path", type=str, default=None)
+    parser.add_argument("--resume_path", type=str, default=None)
     parser.add_argument("--mswc_split", type=str, default="train[:10000]")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=128)
@@ -874,7 +346,7 @@ if __name__ == "__main__":
     parser.add_argument("--early_stopping_patience", type=int, default=5)
     parser.add_argument("--wavlm_model", type=str, default="microsoft/wavlm-large")
     parser.add_argument("--whisper_model", type=str, default="openai/whisper-base")
-    parser.add_argument("--no_cache_teachers", action="store_true", help="Disable 1-pass offline teacher caching")
+    parser.add_argument("--no_cache_teachers", action="store_true")
     
     args = parser.parse_args()
     run_training(
