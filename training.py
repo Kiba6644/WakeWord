@@ -490,42 +490,55 @@ def cosine_distillation_loss(student_proj, teacher_embed):
     t_norm = F.normalize(teacher_embed, p=2, dim=-1)
     return (1.0 - (s_norm * t_norm).sum(dim=-1)).mean()
 
-def compute_prototypical_loss(embeds, words):
-    word_to_indices = defaultdict(list)
-    for i, w in enumerate(words):
-        word_to_indices[w].append(i)
-        
-    classes = [w for w, idxs in word_to_indices.items() if len(idxs) >= 2]
-    if len(classes) < 2:
-        return torch.tensor(0.0, device=embeds.device, requires_grad=True), 1.0
-        
-    prototypes = []
-    queries = []
-    query_labels = []
+def supervised_contrastive_loss(embeds, words, temperature=0.1):
+    """
+    SOTA Supervised Contrastive Loss + Uniformity Fallback.
+    Forces embeddings of the same word together, and different words apart.
+    Shatters dimensional collapse / anisotropy to ensure random words have ~0.10 similarity.
+    """
+    device = embeds.device
+    B = embeds.shape[0]
     
-    for c_idx, c in enumerate(classes):
-        idxs = word_to_indices[c]
-        support_idx = idxs[0]
-        query_idxs = idxs[1:]
-        
-        proto = embeds[support_idx:support_idx+1]
-        prototypes.append(proto)
-        
-        for q_idx in query_idxs:
-            queries.append(embeds[q_idx:q_idx+1])
-            query_labels.append(c_idx)
-            
-    prototypes = torch.cat(prototypes, dim=0)
-    prototypes = F.normalize(prototypes, p=2, dim=-1)
-    queries = torch.cat(queries, dim=0)
-    query_labels = torch.tensor(query_labels, dtype=torch.long, device=embeds.device)
+    # Normalize (should already be normalized, but safe)
+    embeds = F.normalize(embeds, p=2, dim=-1)
     
-    diff = queries.unsqueeze(1) - prototypes.unsqueeze(0)
-    dists = torch.sqrt(torch.sum(diff ** 2, dim=-1) + 1e-8)
-    log_p_y = F.log_softmax(-dists * 5.0, dim=1)
-    loss = F.nll_loss(log_p_y, query_labels)
+    # Cosine similarity matrix
+    sim_matrix = torch.matmul(embeds, embeds.T) / temperature
     
-    acc = (log_p_y.max(dim=1)[1] == query_labels).float().mean().item()
+    # Numerical stability
+    sim_max, _ = torch.max(sim_matrix, dim=1, keepdim=True)
+    logits = sim_matrix - sim_max.detach()
+    
+    # Mask of positives (1 if same word)
+    labels = np.array(words)
+    mask = torch.tensor(labels[:, None] == labels[None, :], dtype=torch.float32, device=device)
+    
+    # Remove self-contrast
+    logits_mask = torch.scatter(torch.ones_like(mask), 1, torch.arange(B, device=device).view(-1, 1), 0)
+    mask = mask * logits_mask
+    
+    # Compute log_prob
+    exp_logits = torch.exp(logits) * logits_mask
+    log_prob = logits - torch.log(exp_logits.sum(1, keepdim=True) + 1e-8)
+    
+    # Mean of log-likelihood over positives
+    mask_sum = mask.sum(1)
+    valid_mask = mask_sum > 0
+    
+    if not valid_mask.any():
+        # Fallback: Uniformity Loss (pushes all distinct clips apart to prevent collapse)
+        sq_dist = torch.pdist(embeds, p=2).pow(2)
+        return torch.log(torch.mean(torch.exp(-2.0 * sq_dist))), 0.0
+        
+    mean_log_prob_pos = (mask * log_prob).sum(1)[valid_mask] / mask_sum[valid_mask]
+    loss = -mean_log_prob_pos.mean()
+    
+    # Accuracy calculation for tracking
+    sim_matrix.fill_diagonal_(-1e9)
+    top1_idx = sim_matrix.argmax(dim=1)
+    top1_is_pos = mask[torch.arange(B), top1_idx]
+    acc = top1_is_pos[valid_mask].mean().item()
+    
     return loss, acc
 
 def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device, batch_size=256):
@@ -747,12 +760,12 @@ def run_training(
                 )
                 
                 loss_tier_c = truncation_margin_loss(norm_embed, trunc_embed)
-                loss_proto, p_acc = compute_prototypical_loss(norm_embed, batch["words"])
+                loss_supcon, p_acc = supervised_contrastive_loss(norm_embed, batch["words"])
                 
                 if is_pretrain:
                     loss = (WAVLM_DISTILL_WEIGHT * loss_wavlm) + (WHISPER_DISTILL_WEIGHT * loss_whisper) + (CTC_LOSS_WEIGHT * loss_ctc)
                 else:
-                    loss = (loss_proto + 
+                    loss = (loss_supcon + 
                             (TRUNCATION_AUX_WEIGHT * loss_tier_c) + 
                             (WAVLM_DISTILL_WEIGHT * loss_wavlm) + 
                             (WHISPER_DISTILL_WEIGHT * loss_whisper) + 
@@ -775,7 +788,7 @@ def run_training(
         # Validation & Early Stopping
         student.eval()
         val_trunc_loss = 0.0
-        val_proto_loss = 0.0
+        val_supcon_loss = 0.0
         val_batches = 0
         
         with torch.no_grad():
@@ -789,15 +802,15 @@ def run_training(
                 v_trunc_embed = student(v_trunc, mask=v_mask)
                 
                 val_trunc_loss += truncation_margin_loss(v_embed, v_trunc_embed).item()
-                p_loss, _ = compute_prototypical_loss(v_embed, v_batch["words"])
-                val_proto_loss += p_loss.item()
+                p_loss, _ = supervised_contrastive_loss(v_embed, v_batch["words"])
+                val_supcon_loss += p_loss.item()
                 val_batches += 1
                 
         val_trunc_loss /= val_batches
-        val_proto_loss /= val_batches
-        val_combined = val_trunc_loss + val_proto_loss # We want to minimize both
+        val_supcon_loss /= val_batches
+        val_combined = val_trunc_loss + val_supcon_loss # We want to minimize both
         
-        print(f"Epoch {epoch+1} Done | Train Loss: {avg_train_loss:.4f} | Val Trunc: {val_trunc_loss:.4f} | Val Proto: {val_proto_loss:.4f}")
+        print(f"Epoch {epoch+1} Done | Train Loss: {avg_train_loss:.4f} | Val Trunc: {val_trunc_loss:.4f} | Val SupCon: {val_supcon_loss:.4f}")
         
         if val_combined < best_val_loss:
             best_val_loss = val_combined
@@ -823,7 +836,7 @@ def run_training(
     student.load_state_dict(torch.load(os.path.join(output_dir, "best_sota_wakeword_model.pt"), map_location=device)['model_state_dict'])
     student.eval()
     
-    dummy_input = torch.randn(1, 40, int(1.2 * SR / HOP_LENGTH)).to(device)
+    dummy_input = torch.randn(1, 1, int(1.2 * SR / HOP_LENGTH), 40).to(device)
     onnx_path = os.path.join(output_dir, "wakeword_student.onnx")
     
     try:
