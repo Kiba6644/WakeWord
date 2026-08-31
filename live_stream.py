@@ -19,6 +19,7 @@ try:
 except ImportError:
     print("\n⚠️  'sounddevice' is required for live mic feed. Install with:")
     print("   pip install sounddevice soundfile\n")
+    sys.exit(1)
 
 try:
     import onnxruntime as ort
