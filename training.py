@@ -102,7 +102,7 @@ def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device
         wavlm = nn.DataParallel(wavlm)
         whisper = nn.DataParallel(whisper)
 
-    workers = min(4, os.cpu_count() or 4)
+    workers = min(8, os.cpu_count() or 8)
     loader = DataLoader(
         ds, 
         batch_size=batch_size, 
@@ -189,7 +189,7 @@ def run_training(
     
     teacher_targets = None
     if cache_teachers:
-        teacher_targets = precompute_teacher_features(ds, wavlm_model, whisper_model, device, batch_size=256,
+        teacher_targets = precompute_teacher_features(ds, wavlm_model, whisper_model, device, batch_size=1024,
                                                       cache_dir=teacher_cache_dir)
     
     train_size = int(0.9 * len(ds))
