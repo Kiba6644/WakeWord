@@ -63,7 +63,7 @@ class MSWCTrainingDataset(Dataset):
         raw_audio = item["audio"]["array"]
         in_sr = item["audio"]["sampling_rate"]
         
-        word = item.get("word")
+        word = item.get("keyword") or item.get("word")
         if not word and "label" in item:
             val = item["label"]
             
