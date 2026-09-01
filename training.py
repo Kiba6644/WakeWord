@@ -49,7 +49,16 @@ def _fast_cache_collate(batch):
         
     wavs_np = np.stack(wavs, axis=0)
     wavs_t = torch.tensor(wavs_np, dtype=torch.float16)
-    wh_inputs = _worker_whisper_extractor(list(wavs_np), sampling_rate=SR, return_tensors="pt").input_features.half()
+    
+    # Extract Whisper features in chunks to avoid system OOM
+    wh_features = []
+    chunk_size = 128
+    for i in range(0, len(wavs_np), chunk_size):
+        chunk = list(wavs_np[i:i+chunk_size])
+        feats = _worker_whisper_extractor(chunk, sampling_rate=SR, return_tensors="pt").input_features.half()
+        wh_features.append(feats)
+        
+    wh_inputs = torch.cat(wh_features, dim=0)
     
     return wavs_t, wh_inputs
 
@@ -102,7 +111,7 @@ def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device
         wavlm = nn.DataParallel(wavlm)
         whisper = nn.DataParallel(whisper)
 
-    workers = min(8, os.cpu_count() or 8)
+    workers = min(4, os.cpu_count() or 4)
     loader = DataLoader(
         ds, 
         batch_size=batch_size, 
@@ -189,7 +198,7 @@ def run_training(
     
     teacher_targets = None
     if cache_teachers:
-        teacher_targets = precompute_teacher_features(ds, wavlm_model, whisper_model, device, batch_size=1024,
+        teacher_targets = precompute_teacher_features(ds, wavlm_model, whisper_model, device, batch_size=512,
                                                       cache_dir=teacher_cache_dir)
     
     train_size = int(0.9 * len(ds))
