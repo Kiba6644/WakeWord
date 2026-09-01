@@ -60,11 +60,17 @@ class MSWCTrainingDataset(Dataset):
         word = item.get("word")
         if not word and "label" in item:
             val = item["label"]
+            
+            # Unpack Subset to reach HF dataset features if necessary
+            base_ds = self.dataset
+            while hasattr(base_ds, "dataset"):
+                base_ds = base_ds.dataset
+                
             if isinstance(val, str):
                 word = val
-            elif hasattr(self.dataset, "features") and "label" in self.dataset.features:
+            elif hasattr(base_ds, "features") and "label" in base_ds.features:
                 try:
-                    word = self.dataset.features["label"].int2str(val)
+                    word = base_ds.features["label"].int2str(val)
                 except Exception:
                     word = str(val)
             else:

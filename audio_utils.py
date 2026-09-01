@@ -95,12 +95,11 @@ def endpoint_utterance(stream_buffer: np.ndarray, sr: int,
 def create_truncated_clip(wav: np.ndarray, sr: int) -> np.ndarray:
     cut_ratio = np.random.uniform(0.60, 0.85)
     cut_point = max(int(MIN_CLIP_SEC * sr), int(len(wav) * cut_ratio))
-    truncated = wav[:cut_point]
     
-    min_samples = int(MIN_CLIP_SEC * sr)
-    if len(truncated) < min_samples:
-        pad_needed = min_samples - len(truncated)
-        truncated = np.pad(truncated, (0, pad_needed), mode='constant')
+    # Maintain exact temporal alignment: just zero out the tail
+    truncated = wav.copy()
+    if cut_point < len(truncated):
+        truncated[cut_point:] = 0
         
     return truncated
 
