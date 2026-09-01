@@ -109,14 +109,14 @@ class WakeWordModel(nn.Module):
             self.fc = nn.Linear(channels[-1], embed_dim)
 
         self.distill_wavlm_proj = nn.Sequential(
-            nn.Linear(embed_dim, 512),
+            nn.Linear(embed_dim, 512, bias=False),
             nn.SiLU(inplace=True),
-            nn.Linear(512, WAVLM_EMBED_DIM)
+            nn.Linear(512, WAVLM_EMBED_DIM, bias=False)
         )
         self.distill_whisper_proj = nn.Sequential(
-            nn.Linear(embed_dim, 256),
+            nn.Linear(embed_dim, 256, bias=False),
             nn.SiLU(inplace=True),
-            nn.Linear(256, WHISPER_EMBED_DIM)
+            nn.Linear(256, WHISPER_EMBED_DIM, bias=False)
         )
         self.ctc_head = nn.Sequential(
             nn.Linear(channels[-1], channels[-1] // 2),
