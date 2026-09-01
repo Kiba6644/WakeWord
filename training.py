@@ -211,15 +211,20 @@ class WordBalancedBatchSampler(Sampler):
         indices = subset.indices
         
         # Pre-fetch words to avoid slow item-by-item loading if possible
-        if "word" in hf_dataset.features:
-            all_words = hf_dataset["word"]
+        word_key = None
+        if "keyword" in hf_dataset.features: word_key = "keyword"
+        elif "word" in hf_dataset.features: word_key = "word"
+        elif "label" in hf_dataset.features: word_key = "label"
+        
+        if word_key and hasattr(hf_dataset, word_key):
+            all_words = hf_dataset[word_key]
             for i, actual_idx in enumerate(indices):
                 w = str(all_words[actual_idx]) if all_words[actual_idx] else "unknown"
                 self.word_to_indices[w].append(i)
         else:
             for i, actual_idx in enumerate(indices):
                 item = hf_dataset[actual_idx]
-                w = item.get("word") or item.get("label")
+                w = item.get("keyword") or item.get("word") or item.get("label")
                 w = str(w) if w else "unknown"
                 self.word_to_indices[w].append(i)
                 
@@ -229,23 +234,26 @@ class WordBalancedBatchSampler(Sampler):
     def __iter__(self):
         if not self.valid_words:
             # Fallback to random if dataset is completely scattered
-            yield from [random.sample(range(len(self.dataset)), self.batch_size)]
+            for _ in range(len(self)):
+                yield random.sample(range(len(self.dataset)), self.batch_size)
             return
             
         word_pool = list(self.valid_words)
-        random.shuffle(word_pool)
+        num_batches = len(self)
         
-        batch = []
-        for word in word_pool:
-            idxs = random.sample(self.word_to_indices[word], self.samples_per_word)
-            batch.extend(idxs)
-            if len(batch) >= self.batch_size:
-                random.shuffle(batch)
-                yield batch[:self.batch_size]
-                batch = []
-                
-        if len(batch) > 0:
-            yield batch
+        for _ in range(num_batches):
+            random.shuffle(word_pool)
+            batch = []
+            
+            # Keep pulling words until batch is full
+            for word in word_pool:
+                idxs = random.sample(self.word_to_indices[word], self.samples_per_word)
+                batch.extend(idxs)
+                if len(batch) >= self.batch_size:
+                    break
+                    
+            random.shuffle(batch)
+            yield batch[:self.batch_size]
 
     def __len__(self):
         return len(self.dataset) // self.batch_size
