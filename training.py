@@ -54,12 +54,14 @@ def _fast_cache_collate(batch):
     return wavs_t, wh_inputs
 
 
-def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device, batch_size=1024):
+def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device, batch_size=1024,
+                                cache_dir: str = "./teacher_cache"):
     """
     Max-speed 1-pass teacher embedding cache.
     Optimizations:
-    1. DataLoader extracts Whisper features in parallel CPU workers
-    2. DataParallel scales across all available GPUs (e.g. 2x T4 on Kaggle)
+    1. Disk cache keyed by (num_samples, wavlm_model, whisper_model) — skips recomputation on restart.
+    2. DataLoader extracts Whisper features in parallel CPU workers
+    3. DataParallel scales across all available GPUs (e.g. 2x T4 on Kaggle)
     """
     import time
     import os
@@ -68,6 +70,20 @@ def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device
     from torch.utils.data import DataLoader
     from transformers import WavLMModel, WhisperModel, WhisperFeatureExtractor
     from config import SR
+
+    # ── Disk cache: build a deterministic key ───────────────────────────────
+    os.makedirs(cache_dir, exist_ok=True)
+    _wlm_tag = wavlm_model_name.replace("/", "_")
+    _wh_tag  = whisper_model_name.replace("/", "_")
+    cache_path = os.path.join(cache_dir, f"teacher_{len(ds)}_{_wlm_tag}_{_wh_tag}.pt")
+
+    if os.path.exists(cache_path):
+        print(f"\n💾 Loading cached teacher embeddings from:\n   {cache_path}")
+        data = torch.load(cache_path, map_location="cpu")
+        print(f"✅ Cache loaded — {len(ds):,} samples  "
+              f"(wavlm {tuple(data['wavlm'].shape)}, whisper {tuple(data['whisper'].shape)})")
+        return data
+    # ────────────────────────────────────────────────────────────────────────
 
     print(f"\n⚡ Pre-extracting Teacher Embeddings (Max Speed: Multi-GPU + Multi-Core)...")
     print(f"  • WavLM  : {wavlm_model_name}")
@@ -142,7 +158,12 @@ def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device
     gc.collect()
     torch.cuda.empty_cache()
 
-    return {"wavlm": wavlm_all, "whisper": whisper_all}
+    result = {"wavlm": wavlm_all, "whisper": whisper_all}
+    print(f"💾 Saving teacher cache to:\n   {cache_path}  ({mem_mb:.1f} MB)")
+    torch.save(result, cache_path)
+    print(f"✅ Cache saved — future runs will skip recomputation.")
+
+    return result
 
 def run_training(
     noise_dir: str = "./noise",
@@ -155,9 +176,10 @@ def run_training(
     lr: float = 5e-4,
     weight_decay: float = 1e-4,
     early_stopping_patience: int = 5,
-    wavlm_model: str = "microsoft/wavlm-large",
+    wavlm_model: str = "microsoft/wavlm-base-plus",
     whisper_model: str = "openai/whisper-base",
-    cache_teachers: bool = True
+    cache_teachers: bool = True,
+    teacher_cache_dir: str = "./teacher_cache"
 ):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(output_dir, exist_ok=True)
@@ -167,7 +189,8 @@ def run_training(
     
     teacher_targets = None
     if cache_teachers:
-        teacher_targets = precompute_teacher_features(ds, wavlm_model, whisper_model, device, batch_size=256)
+        teacher_targets = precompute_teacher_features(ds, wavlm_model, whisper_model, device, batch_size=256,
+                                                      cache_dir=teacher_cache_dir)
     
     train_size = int(0.9 * len(ds))
     val_size = len(ds) - train_size
@@ -350,6 +373,18 @@ def run_training(
     except Exception as e:
         print(f"ONNX Export failed: {e}")
 
+    # Export teacher cache to output dir if it exists
+    if cache_teachers:
+        import shutil
+        _wlm_tag = wavlm_model.replace("/", "_")
+        _wh_tag  = whisper_model.replace("/", "_")
+        cache_file = f"teacher_{len(ds)}_{_wlm_tag}_{_wh_tag}.pt"
+        src_cache = os.path.join(teacher_cache_dir, cache_file)
+        if os.path.exists(src_cache):
+            dst_cache = os.path.join(output_dir, cache_file)
+            print(f"Copying teacher cache to output directory: {dst_cache}")
+            shutil.copy2(src_cache, dst_cache)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--noise_dir", type=str, default="./noise")
@@ -361,9 +396,11 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--early_stopping_patience", type=int, default=5)
-    parser.add_argument("--wavlm_model", type=str, default="microsoft/wavlm-large")
+    parser.add_argument("--wavlm_model", type=str, default="microsoft/wavlm-base-plus")
     parser.add_argument("--whisper_model", type=str, default="openai/whisper-base")
     parser.add_argument("--no_cache_teachers", action="store_true")
+    parser.add_argument("--teacher_cache_dir", type=str, default="./teacher_cache",
+                        help="Directory to store/load precomputed teacher embeddings on disk.")
     
     args = parser.parse_args()
     run_training(
@@ -378,5 +415,6 @@ if __name__ == "__main__":
         early_stopping_patience=args.early_stopping_patience,
         wavlm_model=args.wavlm_model,
         whisper_model=args.whisper_model,
-        cache_teachers=not args.no_cache_teachers
+        cache_teachers=not args.no_cache_teachers,
+        teacher_cache_dir=args.teacher_cache_dir,
     )
