@@ -391,16 +391,14 @@ def run_training(
             
             mels = batch["mels"].to(device, non_blocking=True)
             trunc_mels = batch["trunc_mels"].to(device, non_blocking=True)
-            wavs_np = np.stack(batch["wavs"], axis=0)
-            wavs_t = torch.tensor(wavs_np, dtype=torch.float32, device=device)
-            
             energy = mels.mean(dim=-1).squeeze(1)
             attention_mask = energy > -10.0
-            
             if "wavlm_targets" in batch:
                 wavlm_target = batch["wavlm_targets"].to(device, non_blocking=True)
                 whisper_target = batch["whisper_targets"].to(device, non_blocking=True)
             else:
+                wavs_np = np.stack(batch["wavs"], axis=0)
+                wavs_t = torch.tensor(wavs_np, dtype=torch.float32, device=device)
                 with torch.no_grad(), autocast('cuda'):
                     wavlm_out = wavlm(wavs_t).last_hidden_state
                     wavlm_target = wavlm_out.mean(dim=1)
