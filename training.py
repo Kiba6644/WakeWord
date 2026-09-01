@@ -198,6 +198,7 @@ def run_training(
     dataset_path: str = None,
     resume_path: str = None,
     mswc_split: str = "train[:10000]",
+    max_train_samples: int = None,
     epochs: int = 50,
     batch_size: int = 128,
     lr: float = 5e-4,
@@ -218,6 +219,14 @@ def run_training(
     if cache_teachers:
         teacher_targets = precompute_teacher_features(ds, wavlm_model, whisper_model, device, batch_size=512,
                                                       cache_dir=teacher_cache_dir)
+    
+    # Slice dataset AFTER loading the cache (cache key uses full len(ds))
+    # This lets you train on a subset while still reusing the full precomputed cache.
+    if max_train_samples is not None and max_train_samples < len(ds):
+        print(f"📦 Slicing dataset: using first {max_train_samples:,} of {len(ds):,} samples")
+        ds = ds.select(range(max_train_samples))
+        if teacher_targets is not None:
+            teacher_targets = {k: v[:max_train_samples] for k, v in teacher_targets.items()}
     
     train_size = int(0.9 * len(ds))
     val_size = len(ds) - train_size
@@ -428,6 +437,9 @@ if __name__ == "__main__":
     parser.add_argument("--no_cache_teachers", action="store_true")
     parser.add_argument("--teacher_cache_dir", type=str, default="./teacher_cache",
                         help="Directory to store/load precomputed teacher embeddings on disk.")
+    parser.add_argument("--max_train_samples", type=int, default=None,
+                        help="Train on only the first N samples from the full dataset split, "
+                             "while still reusing a larger precomputed teacher cache.")
     
     args = parser.parse_args()
     run_training(
@@ -436,6 +448,7 @@ if __name__ == "__main__":
         dataset_path=args.dataset_path,
         resume_path=args.resume_path,
         mswc_split=args.mswc_split,
+        max_train_samples=args.max_train_samples,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
