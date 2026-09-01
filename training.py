@@ -5,7 +5,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import LambdaLR
 
 from config import (SR, WARMUP_EPOCHS, MIN_LR, GRAD_CLIP_NORM,
@@ -61,7 +61,10 @@ def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device
     from config import SR
 
     # ── Disk cache: build a deterministic key ───────────────────────────────
-    os.makedirs(cache_dir, exist_ok=True)
+    try:
+        os.makedirs(cache_dir, exist_ok=True)
+    except OSError:
+        pass  # E.g. Kaggle /kaggle/input/ is read-only, which is fine if reading an existing cache
     _wlm_tag = wavlm_model_name.replace("/", "_")
     _wh_tag  = whisper_model_name.replace("/", "_")
     cache_path = os.path.join(cache_dir, f"teacher_{len(ds)}_{_wlm_tag}_{_wh_tag}.pt")
@@ -200,7 +203,7 @@ def run_training(
     lr: float = 5e-4,
     weight_decay: float = 1e-4,
     early_stopping_patience: int = 5,
-    wavlm_model: str = "microsoft/wavlm-base-plus",
+    wavlm_model: str = "microsoft/wavlm-large",
     whisper_model: str = "openai/whisper-base",
     cache_teachers: bool = True,
     teacher_cache_dir: str = "./teacher_cache"
@@ -254,7 +257,7 @@ def run_training(
         return (MIN_LR/lr) + (1.0 - (MIN_LR/lr)) * 0.5 * (1.0 + math.cos(math.pi * prog))
         
     scheduler = LambdaLR(optimizer, lr_lambda)
-    scaler = GradScaler()
+    scaler = GradScaler('cuda')
     ctc_loss_fn = nn.CTCLoss(blank=0, zero_infinity=True)
     
     best_val_loss = float("inf")
@@ -290,7 +293,7 @@ def run_training(
                 wavlm_target = batch["wavlm_targets"].to(device, non_blocking=True)
                 whisper_target = batch["whisper_targets"].to(device, non_blocking=True)
             else:
-                with torch.no_grad(), autocast():
+                with torch.no_grad(), autocast('cuda'):
                     wavlm_out = wavlm(wavs_t).last_hidden_state
                     wavlm_target = wavlm_out.mean(dim=1)
                     whisper_inputs = whisper_extractor(
@@ -299,7 +302,7 @@ def run_training(
                     whisper_out = whisper(whisper_inputs).last_hidden_state
                     whisper_target = whisper_out.mean(dim=1)
             
-            with autocast():
+            with autocast('cuda'):
                 norm_embed, (s_wavlm_proj, s_whisper_proj), ctc_logits = student(mels, mask=attention_mask, return_distill=True)
                 trunc_embed = student(trunc_mels, mask=attention_mask)
                 
@@ -420,7 +423,7 @@ if __name__ == "__main__":
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--early_stopping_patience", type=int, default=5)
-    parser.add_argument("--wavlm_model", type=str, default="microsoft/wavlm-base-plus")
+    parser.add_argument("--wavlm_model", type=str, default="microsoft/wavlm-large")
     parser.add_argument("--whisper_model", type=str, default="openai/whisper-base")
     parser.add_argument("--no_cache_teachers", action="store_true")
     parser.add_argument("--teacher_cache_dir", type=str, default="./teacher_cache",
