@@ -51,8 +51,7 @@ def supervised_contrastive_loss(embeds, words, temperature=0.07,
     mask_sum = mask.sum(1)
     valid_mask = mask_sum > 0
     if not valid_mask.any():
-        sq_dist = torch.pdist(embeds, p=2).pow(2)
-        return torch.log(torch.mean(torch.exp(-2.0 * sq_dist))), 0.0
+        return (embeds.sum() * 0.0), 0.0
     mean_log_prob_pos = (mask * log_prob).sum(1)[valid_mask] / mask_sum[valid_mask]
     loss = -mean_log_prob_pos.mean()
     sim_matrix.fill_diagonal_(-1e4)

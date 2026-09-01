@@ -309,9 +309,13 @@ def run_training(
         batch_sampler=train_sampler,
         collate_fn=collate_fn, num_workers=4, pin_memory=True
     )
+    val_dataset = MSWCTrainingDataset(val_ds, noise_clips=noise_bank, teacher_targets=teacher_targets, indices=val_ds.indices if teacher_targets else None)
+    val_sampler = WordBalancedBatchSampler(val_dataset, batch_size=batch_size, samples_per_word=4)
+    
     val_loader = DataLoader(
-        MSWCTrainingDataset(val_ds, noise_clips=noise_bank, teacher_targets=teacher_targets, indices=val_ds.indices if teacher_targets else None),
-        batch_size=batch_size, shuffle=False, collate_fn=collate_fn, num_workers=4, pin_memory=True
+        val_dataset,
+        batch_sampler=val_sampler,
+        collate_fn=collate_fn, num_workers=4, pin_memory=True
     )
     
     student = WakeWordModel().to(device)
@@ -466,9 +470,11 @@ def run_training(
         if val_batches > 0:
             val_trunc_loss /= val_batches
             val_supcon_loss /= val_batches
-        val_combined = val_trunc_loss + val_supcon_loss
         
-        print(f"Epoch {epoch+1} Done | Train Loss: {avg_train_loss:.4f} | Val Trunc: {val_trunc_loss:.4f} | Val SupCon: {val_supcon_loss:.4f}")
+        # Weight the validation metric exactly as they are weighted in training
+        val_combined = (TRUNCATION_AUX_WEIGHT * val_trunc_loss) + (SUPCON_WEIGHT * val_supcon_loss)
+        
+        print(f"Epoch {epoch+1} Done | Train Loss: {avg_train_loss:.4f} | Val Trunc: {val_trunc_loss:.4f} | Val SupCon: {val_supcon_loss:.4f} | Val Combined: {val_combined:.4f}")
         
         if val_combined < best_val_loss:
             best_val_loss = val_combined
