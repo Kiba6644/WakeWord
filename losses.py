@@ -12,14 +12,34 @@ def cosine_distillation_loss(student_proj, teacher_embed):
     t_norm = F.normalize(teacher_embed, p=2, dim=-1)
     return (1.0 - (s_norm * t_norm).sum(dim=-1)).mean()
 
-def supervised_contrastive_loss(embeds, words, temperature=0.1):
+def supervised_contrastive_loss(embeds, words, temperature=0.07,
+                                init_temperature=None, warmup_frac=0.0):
+    """Supervised contrastive loss with optional temperature warm-up.
+
+    Args:
+        embeds:           [B, D] embedding tensor (any dtype; cast internally to float32).
+        words:            list/array of length B with string class labels.
+        temperature:      final (minimum) temperature.  Default 0.07 – good for
+                          well-trained embeddings.
+        init_temperature: starting temperature for the warm-up schedule.
+                          If None, no warm-up is applied (temperature is fixed).
+        warmup_frac:      float in [0, 1].  0 = start of warm-up (use init_temp),
+                          1 = end of warm-up (use final temp).  Pass
+                          `step / total_steps` from the training loop.
+    """
     device = embeds.device
     B = embeds.shape[0]
     if B < 2:
         return (embeds.sum() * 0.0), 0.0
-        
-    embeds = F.normalize(embeds, p=2, dim=-1)
-    sim_matrix = torch.matmul(embeds, embeds.T) / temperature
+
+    # Temperature schedule: cosine decay from init_temperature → temperature
+    if init_temperature is not None and init_temperature > temperature:
+        t = init_temperature + (temperature - init_temperature) * warmup_frac
+    else:
+        t = temperature
+
+    embeds = F.normalize(embeds.float(), p=2, dim=-1)
+    sim_matrix = torch.matmul(embeds, embeds.T) / t
     sim_max, _ = torch.max(sim_matrix, dim=1, keepdim=True)
     logits = sim_matrix - sim_max.detach()
     labels = np.array(words)

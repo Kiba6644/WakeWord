@@ -352,13 +352,23 @@ def run_training(
         if 'val_metric' in checkpoint:
             best_val_loss = checkpoint['val_metric']
     
+    # Temperature warm-up schedule for SupCon: high temp early → sharp temp later
+    SUPCON_INIT_TEMP  = 0.5   # Start warm (easy gradients, loose clustering)
+    SUPCON_FINAL_TEMP = 0.07  # End sharp (tight clustering)
+    SUPCON_WEIGHT     = 0.5   # Down-weight so SupCon doesn't drown distillation
+    post_pretrain_epochs = max(1, epochs - 5)
+
     for epoch in range(start_epoch, epochs):
         student.train()
         is_pretrain = (epoch < 5)
         if epoch == 5:
             print("\n🚀 Pre-training complete! Enabling Supervised Contrastive & Truncation losses...\n")
         total_epoch_loss = 0.0
-        
+
+        steps_per_epoch = len(train_loader)
+        # Fraction of post-pretrain training completed (0 → 1)
+        post_pretrain_step_offset = max(0, epoch - 5) * steps_per_epoch
+
         for step, batch in enumerate(train_loader):
             optimizer.zero_grad(set_to_none=True)
             
@@ -397,12 +407,21 @@ def run_training(
                 )
                 
                 loss_tier_c = truncation_margin_loss(norm_embed, trunc_embed)
-                loss_supcon, p_acc = supervised_contrastive_loss(norm_embed, batch["words"])
+
+                # Compute warmup_frac for temperature schedule
+                warmup_frac = min(1.0, (post_pretrain_step_offset + step) /
+                                  (post_pretrain_epochs * steps_per_epoch))
+                loss_supcon, p_acc = supervised_contrastive_loss(
+                    norm_embed, batch["words"],
+                    temperature=SUPCON_FINAL_TEMP,
+                    init_temperature=SUPCON_INIT_TEMP,
+                    warmup_frac=warmup_frac,
+                )
                 
                 if is_pretrain:
                     loss = (WAVLM_DISTILL_WEIGHT * loss_wavlm) + (WHISPER_DISTILL_WEIGHT * loss_whisper) + (CTC_LOSS_WEIGHT * loss_ctc)
                 else:
-                    loss = (loss_supcon + 
+                    loss = (SUPCON_WEIGHT * loss_supcon +
                             (TRUNCATION_AUX_WEIGHT * loss_tier_c) + 
                             (WAVLM_DISTILL_WEIGHT * loss_wavlm) + 
                             (WHISPER_DISTILL_WEIGHT * loss_whisper) + 
@@ -417,7 +436,8 @@ def run_training(
             total_epoch_loss += loss.item()
             
             if step % 25 == 0:
-                print(f"Step {step:03d} | Loss: {loss.item():.4f} | Distill: {(loss_wavlm+loss_whisper).item():.3f} | TierC: {loss_tier_c.item():.3f} | Proto: {loss_supcon.item():.3f}")
+                cur_temp = SUPCON_INIT_TEMP + (SUPCON_FINAL_TEMP - SUPCON_INIT_TEMP) * warmup_frac if not is_pretrain else SUPCON_FINAL_TEMP
+                print(f"Step {step:03d} | Loss: {loss.item():.4f} | Distill: {(loss_wavlm+loss_whisper).item():.3f} | TierC: {loss_tier_c.item():.3f} | Proto: {loss_supcon.item():.3f} | Temp: {cur_temp:.3f}")
                 
         scheduler.step()
         avg_train_loss = total_epoch_loss / len(train_loader)
