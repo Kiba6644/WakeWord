@@ -500,7 +500,7 @@ def run_training(
     try:
         torch.onnx.export(
             student, dummy_input, onnx_path,
-            export_params=True, opset_version=17, do_constant_folding=True,
+            export_params=True, opset_version=18, do_constant_folding=True,
             input_names=['input_mel'], output_names=['embedding'],
             dynamic_axes={'input_mel': {0: 'batch_size', 2: 'time'}, 'embedding': {0: 'batch_size'}}
         )
