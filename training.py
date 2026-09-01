@@ -356,6 +356,11 @@ def run_training(
             start_epoch = checkpoint['epoch'] + 1
         if 'val_metric' in checkpoint:
             best_val_loss = checkpoint['val_metric']
+        if 'optimizer_state_dict' in checkpoint:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        if 'scheduler_state_dict' in checkpoint:
+            scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        print(f"✅ Resumed from checkpoint: Epoch {start_epoch-1} (Val Loss: {best_val_loss:.4f})")
     
     # Temperature warm-up schedule for SupCon: high temp early → sharp temp later
     SUPCON_INIT_TEMP  = 0.5   # Start warm (easy gradients, loose clustering)
@@ -485,6 +490,8 @@ def run_training(
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': student.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
                 'val_metric': best_val_loss
             }, os.path.join(output_dir, "best_sota_wakeword_model.pt"))
         else:
