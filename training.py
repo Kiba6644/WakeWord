@@ -543,7 +543,7 @@ if __name__ == "__main__":
     parser.add_argument("--output_dir", type=str, default="./output")
     parser.add_argument("--dataset_path", type=str, default=None)
     parser.add_argument("--resume_path", type=str, default=None)
-    parser.add_argument("--mswc_split", type=str, default="train[:10000]")
+    parser.add_argument("--mswc_split", type=str, default=MSWC_SPLIT)
     parser.add_argument("--pretrain_epochs", type=int, default=PRETRAIN_EPOCHS, help="Number of teacher-only pre-training epochs before enabling SupCon/TierC loss.")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=128)
