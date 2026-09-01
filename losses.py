@@ -15,6 +15,9 @@ def cosine_distillation_loss(student_proj, teacher_embed):
 def supervised_contrastive_loss(embeds, words, temperature=0.1):
     device = embeds.device
     B = embeds.shape[0]
+    if B < 2:
+        return (embeds.sum() * 0.0), 0.0
+        
     embeds = F.normalize(embeds, p=2, dim=-1)
     sim_matrix = torch.matmul(embeds, embeds.T) / temperature
     sim_max, _ = torch.max(sim_matrix, dim=1, keepdim=True)

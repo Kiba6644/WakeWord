@@ -26,7 +26,8 @@ from losses import truncation_margin_loss, cosine_distillation_loss, supervised_
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    backend = "gloo" if os.name == "nt" else "nccl"
+    dist.init_process_group(backend, rank=rank, world_size=world_size)
     torch.cuda.set_device(rank)
 
 def cleanup():
@@ -72,7 +73,7 @@ def train(rank, world_size):
         temporal_head=STAGE2_TEMPORAL_HEAD, 
         embed_dim=EMBED_DIM
     ).to(rank)
-    model = DDP(model, device_ids=[rank])
+    model = DDP(model, device_ids=[rank], find_unused_parameters=True)
     
     teachers = load_dual_teachers(rank) if USE_DUAL_DISTILLATION else {}
     
