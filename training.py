@@ -8,7 +8,7 @@ from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import LambdaLR
 
-from config import (SR, WARMUP_EPOCHS, MIN_LR, GRAD_CLIP_NORM,
+from config import (SR, WARMUP_EPOCHS, PRETRAIN_EPOCHS, MIN_LR, GRAD_CLIP_NORM,
                     TRUNCATION_AUX_WEIGHT, WAVLM_DISTILL_WEIGHT, 
                     WHISPER_DISTILL_WEIGHT, CTC_LOSS_WEIGHT)
 from model import WakeWordModel
@@ -265,6 +265,7 @@ def run_training(
     resume_path: str = None,
     mswc_split: str = "train[:10000]",
     max_train_samples: int = None,
+    pretrain_epochs: int = PRETRAIN_EPOCHS,
     epochs: int = 50,
     batch_size: int = 128,
     lr: float = 5e-4,
@@ -356,18 +357,18 @@ def run_training(
     SUPCON_INIT_TEMP  = 0.5   # Start warm (easy gradients, loose clustering)
     SUPCON_FINAL_TEMP = 0.07  # End sharp (tight clustering)
     SUPCON_WEIGHT     = 0.5   # Down-weight so SupCon doesn't drown distillation
-    post_pretrain_epochs = max(1, epochs - 5)
+    post_pretrain_epochs = max(1, epochs - pretrain_epochs)
 
     for epoch in range(start_epoch, epochs):
         student.train()
-        is_pretrain = (epoch < 5)
-        if epoch == 5:
+        is_pretrain = (epoch < pretrain_epochs)
+        if epoch == pretrain_epochs:
             print("\n🚀 Pre-training complete! Enabling Supervised Contrastive & Truncation losses...\n")
         total_epoch_loss = 0.0
 
         steps_per_epoch = len(train_loader)
         # Fraction of post-pretrain training completed (0 → 1)
-        post_pretrain_step_offset = max(0, epoch - 5) * steps_per_epoch
+        post_pretrain_step_offset = max(0, epoch - pretrain_epochs) * steps_per_epoch
 
         for step, batch in enumerate(train_loader):
             optimizer.zero_grad(set_to_none=True)
@@ -520,6 +521,7 @@ if __name__ == "__main__":
     parser.add_argument("--dataset_path", type=str, default=None)
     parser.add_argument("--resume_path", type=str, default=None)
     parser.add_argument("--mswc_split", type=str, default="train[:10000]")
+    parser.add_argument("--pretrain_epochs", type=int, default=PRETRAIN_EPOCHS, help="Number of teacher-only pre-training epochs before enabling SupCon/TierC loss.")
     parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch_size", type=int, default=128)
     parser.add_argument("--lr", type=float, default=5e-4)
@@ -541,6 +543,7 @@ if __name__ == "__main__":
         resume_path=args.resume_path,
         mswc_split=args.mswc_split,
         max_train_samples=args.max_train_samples,
+        pretrain_epochs=args.pretrain_epochs,
         epochs=args.epochs,
         batch_size=args.batch_size,
         lr=args.lr,
