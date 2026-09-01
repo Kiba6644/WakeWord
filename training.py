@@ -10,7 +10,7 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from config import (SR, WARMUP_EPOCHS, PRETRAIN_EPOCHS, MIN_LR, GRAD_CLIP_NORM,
                     TRUNCATION_AUX_WEIGHT, WAVLM_DISTILL_WEIGHT, 
-                    WHISPER_DISTILL_WEIGHT, CTC_LOSS_WEIGHT)
+                    WHISPER_DISTILL_WEIGHT, CTC_LOSS_WEIGHT, MSWC_SPLIT)
 from model import WakeWordModel
 from dataset import (MSWCTrainingDataset, collate_fn, load_speech_dataset, 
                      load_background_noise_bank)
