@@ -192,6 +192,64 @@ def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device
 
     return result
 
+from collections import defaultdict
+import random
+from torch.utils.data import Sampler
+
+class WordBalancedBatchSampler(Sampler):
+    def __init__(self, ms_dataset, batch_size, samples_per_word=4):
+        self.dataset = ms_dataset
+        self.batch_size = batch_size
+        self.samples_per_word = samples_per_word
+        
+        print("🔍 Grouping dataset by words for contrastive sampling...")
+        self.word_to_indices = defaultdict(list)
+        
+        # ms_dataset is MSWCTrainingDataset, ms_dataset.dataset is a Subset
+        subset = ms_dataset.dataset
+        hf_dataset = subset.dataset
+        indices = subset.indices
+        
+        # Pre-fetch words to avoid slow item-by-item loading if possible
+        if "word" in hf_dataset.features:
+            all_words = hf_dataset["word"]
+            for i, actual_idx in enumerate(indices):
+                w = str(all_words[actual_idx]) if all_words[actual_idx] else "unknown"
+                self.word_to_indices[w].append(i)
+        else:
+            for i, actual_idx in enumerate(indices):
+                item = hf_dataset[actual_idx]
+                w = item.get("word") or item.get("label")
+                w = str(w) if w else "unknown"
+                self.word_to_indices[w].append(i)
+                
+        self.valid_words = [w for w, idxs in self.word_to_indices.items() if len(idxs) >= self.samples_per_word]
+        print(f"✅ Found {len(self.valid_words)} distinct words with >= {self.samples_per_word} samples.")
+
+    def __iter__(self):
+        if not self.valid_words:
+            # Fallback to random if dataset is completely scattered
+            yield from [random.sample(range(len(self.dataset)), self.batch_size)]
+            return
+            
+        word_pool = list(self.valid_words)
+        random.shuffle(word_pool)
+        
+        batch = []
+        for word in word_pool:
+            idxs = random.sample(self.word_to_indices[word], self.samples_per_word)
+            batch.extend(idxs)
+            if len(batch) >= self.batch_size:
+                random.shuffle(batch)
+                yield batch[:self.batch_size]
+                batch = []
+                
+        if len(batch) > 0:
+            yield batch
+
+    def __len__(self):
+        return len(self.dataset) // self.batch_size
+
 def run_training(
     noise_dir: str = "./noise",
     output_dir: str = "./output",
@@ -234,9 +292,13 @@ def run_training(
     
     torch.backends.cudnn.benchmark = True
     
+    train_dataset = MSWCTrainingDataset(train_ds, noise_clips=noise_bank, teacher_targets=teacher_targets, indices=train_ds.indices if teacher_targets else None)
+    train_sampler = WordBalancedBatchSampler(train_dataset, batch_size=batch_size, samples_per_word=4)
+    
     train_loader = DataLoader(
-        MSWCTrainingDataset(train_ds, noise_clips=noise_bank, teacher_targets=teacher_targets, indices=train_ds.indices if teacher_targets else None),
-        batch_size=batch_size, shuffle=True, collate_fn=collate_fn, num_workers=4, pin_memory=True
+        train_dataset,
+        batch_sampler=train_sampler,
+        collate_fn=collate_fn, num_workers=4, pin_memory=True
     )
     val_loader = DataLoader(
         MSWCTrainingDataset(val_ds, noise_clips=noise_bank, teacher_targets=teacher_targets, indices=val_ds.indices if teacher_targets else None),
@@ -285,6 +347,8 @@ def run_training(
     for epoch in range(start_epoch, epochs):
         student.train()
         is_pretrain = (epoch < 5)
+        if epoch == 5:
+            print("\n🚀 Pre-training complete! Enabling Supervised Contrastive & Truncation losses...\n")
         total_epoch_loss = 0.0
         
         for step, batch in enumerate(train_loader):
