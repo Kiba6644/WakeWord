@@ -212,16 +212,20 @@ class WordBalancedBatchSampler(Sampler):
         
         # Pre-fetch words to avoid slow item-by-item loading if possible
         word_key = None
-        if "keyword" in hf_dataset.features: word_key = "keyword"
-        elif "word" in hf_dataset.features: word_key = "word"
-        elif "label" in hf_dataset.features: word_key = "label"
+        if hasattr(hf_dataset, "column_names"):
+            for key in ["keyword", "word", "label"]:
+                if key in hf_dataset.column_names:
+                    word_key = key
+                    break
         
-        if word_key and hasattr(hf_dataset, word_key):
+        if word_key:
+            print(f"⚡ Fast columnar extraction using '{word_key}'...")
             all_words = hf_dataset[word_key]
             for i, actual_idx in enumerate(indices):
                 w = str(all_words[actual_idx]) if all_words[actual_idx] else "unknown"
                 self.word_to_indices[w].append(i)
         else:
+            print("⚠️ Warning: Columnar extraction failed, falling back to slow row-by-row extraction...")
             for i, actual_idx in enumerate(indices):
                 item = hf_dataset[actual_idx]
                 w = item.get("keyword") or item.get("word") or item.get("label")
