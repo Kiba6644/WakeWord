@@ -144,7 +144,7 @@ def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device
             log_mel = torch.log10(torch.clamp(mel, min=1e-10))
             # Per-sample max normalization
             B = log_mel.shape[0]
-            max_vals = log_mel.view(B, -1).max(dim=1).values.view(B, 1, 1)
+            max_vals = log_mel.reshape(B, -1).max(dim=1).values.reshape(B, 1, 1)
             log_mel = torch.maximum(log_mel, max_vals - 8.0)
             log_mel = (log_mel + 4.0) / 4.0
 
