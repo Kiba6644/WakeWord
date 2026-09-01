@@ -155,8 +155,12 @@ class WakeWordModel(nn.Module):
         ctc_logits = self.ctc_head(feat) if (return_ctc or return_distill) else None
         
         if return_distill:
-            wavlm_proj = self.distill_wavlm_proj(norm_embed)
-            whisper_proj = self.distill_whisper_proj(norm_embed)
+            # Decouple distillation from the final embedding. 
+            # Distillation teaches the encoder (feat) general acoustics, 
+            # while SupCon teaches the temporal head (norm_embed) strict word clustering.
+            pooled_feat = feat.mean(dim=1)
+            wavlm_proj = self.distill_wavlm_proj(pooled_feat)
+            whisper_proj = self.distill_whisper_proj(pooled_feat)
             return norm_embed, (wavlm_proj, whisper_proj), ctc_logits
             
         if return_ctc:
