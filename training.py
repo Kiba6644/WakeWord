@@ -21,8 +21,14 @@ def _fast_cache_collate(batch):
     import torchaudio
     import numpy as np
     from audio_utils import pad_or_trim
-    from config import SR
+    from config import SR, WHISPER_TEACHER_MODEL
     
+    global _worker_whisper_extractor
+    if '_worker_whisper_extractor' not in globals():
+        from transformers import WhisperFeatureExtractor
+        global _worker_whisper_extractor
+        _worker_whisper_extractor = WhisperFeatureExtractor.from_pretrained(WHISPER_TEACHER_MODEL)
+        
     target_samples = int(1.2 * SR)
     wavs = []
     for item in batch:
@@ -33,43 +39,46 @@ def _fast_cache_collate(batch):
             wav_t = torchaudio.functional.resample(wav_t, in_sr, SR)
         wavs.append(pad_or_trim(wav_t.numpy(), target_samples))
         
-    return torch.tensor(np.stack(wavs, axis=0), dtype=torch.float16)
+    wavs_np = np.stack(wavs, axis=0)
+    wavs_t = torch.tensor(wavs_np, dtype=torch.float16)
+    wh_inputs = _worker_whisper_extractor(list(wavs_np), sampling_rate=SR, return_tensors="pt").input_features.half()
+    
+    return wavs_t, wh_inputs
 
 
-def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device, batch_size=512):
+def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device, batch_size=1024):
     """
     Max-speed 1-pass teacher embedding cache.
-    
     Optimizations:
-    1. DataLoader with num_workers > 0 (Parallel background Opus decoding & padding)
-    2. FP16 Inference (.half()) (2x faster matrix multiplies on Tensor Cores, half VRAM)
-    3. Pinned Memory (Fast CPU->GPU transfers)
-    4. Batched numpy processing for Whisper feature extraction
+    1. DataLoader extracts Whisper features in parallel CPU workers
+    2. DataParallel scales across all available GPUs (e.g. 2x T4 on Kaggle)
     """
     import time
     import os
     import torch
+    import torch.nn as nn
     from torch.utils.data import DataLoader
     from transformers import WavLMModel, WhisperModel, WhisperFeatureExtractor
     from config import SR
 
-    print(f"\n⚡ Pre-extracting Teacher Embeddings (Max Speed: DataLoader + FP16)...")
+    print(f"\n⚡ Pre-extracting Teacher Embeddings (Max Speed: Multi-GPU + Multi-Core)...")
     print(f"  • WavLM  : {wavlm_model_name}")
     print(f"  • Whisper: {whisper_model_name}")
-    print(f"  • Samples: {len(ds):,}   Batch: {batch_size}   Device: {device}")
+    print(f"  • Samples: {len(ds):,}   Batch: {batch_size}   GPUs: {torch.cuda.device_count()}")
 
-    # 1. Load models in FP16 for massive speedup
     wavlm = WavLMModel.from_pretrained(wavlm_model_name).to(device).half()
     wavlm.eval()
     for p in wavlm.parameters(): p.requires_grad = False
 
-    whisper_extractor = WhisperFeatureExtractor.from_pretrained(whisper_model_name)
     whisper = WhisperModel.from_pretrained(whisper_model_name).encoder.to(device).half()
     whisper.eval()
     for p in whisper.parameters(): p.requires_grad = False
 
-    # 2. Parallel Background Collate
-    workers = min(8, os.cpu_count() or 4)
+    if torch.cuda.device_count() > 1:
+        wavlm = nn.DataParallel(wavlm)
+        whisper = nn.DataParallel(whisper)
+
+    workers = min(4, os.cpu_count() or 4)
     loader = DataLoader(
         ds, 
         batch_size=batch_size, 
@@ -85,24 +94,24 @@ def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device
     t_start = time.time()
 
     with torch.no_grad():
-        for batch_idx, wavs_t in enumerate(loader):
+        for batch_idx, (wavs_t, wh_inputs) in enumerate(loader):
             wavs_t = wavs_t.to(device, non_blocking=True)
+            wh_inputs = wh_inputs.to(device, non_blocking=True)
             
-            # WavLM Inference (FP16)
-            w_out = wavlm(wavs_t).last_hidden_state.mean(dim=1).cpu()
+            # WavLM Inference
+            w_out = wavlm(wavs_t)
+            if hasattr(w_out, 'last_hidden_state'): w_out = w_out.last_hidden_state
+            w_out = w_out.mean(dim=1).cpu()
             wavlm_targets.append(w_out)
             
-            # Whisper Inference (FP16)
-            wavs_np = wavs_t.cpu().float().numpy()  # Extractor needs FP32 numpy
-            wh_inputs = whisper_extractor(list(wavs_np), sampling_rate=SR, return_tensors="pt").input_features
-            wh_inputs = wh_inputs.to(device, non_blocking=True).half()
-            
-            wh_out = whisper(wh_inputs).last_hidden_state.mean(dim=1).cpu()
+            # Whisper Inference
+            wh_out = whisper(wh_inputs)
+            if hasattr(wh_out, 'last_hidden_state'): wh_out = wh_out.last_hidden_state
+            wh_out = wh_out.mean(dim=1).cpu()
             whisper_targets.append(wh_out)
             
-            # Progress + ETA
             samples_done = min((batch_idx + 1) * batch_size, num_samples)
-            if (batch_idx + 1) % 2 == 0 or samples_done == num_samples:
+            if (batch_idx + 1) % 1 == 0 or samples_done == num_samples:
                 elapsed = time.time() - t_start
                 rate = samples_done / elapsed
                 remaining = (num_samples - samples_done) / rate if rate > 0 else 0
@@ -120,7 +129,7 @@ def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device
     print(f"✅ Caching complete — {num_samples:,} samples in {total_elapsed:.1f}s "
           f"({num_samples/total_elapsed:.0f} samples/s) | RAM: {mem_mb:.1f} MB")
 
-    del wavlm, whisper, whisper_extractor
+    del wavlm, whisper
     import gc
     gc.collect()
     torch.cuda.empty_cache()
