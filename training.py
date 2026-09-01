@@ -18,25 +18,33 @@ from losses import truncation_margin_loss, cosine_distillation_loss, supervised_
 
 def _fast_cache_collate(batch):
     import torch
-    import torchaudio
     import numpy as np
     from audio_utils import pad_or_trim
     from config import SR, WHISPER_TEACHER_MODEL
     
-    global _worker_whisper_extractor
+    global _worker_whisper_extractor, _worker_resamplers
     if '_worker_whisper_extractor' not in globals():
         from transformers import WhisperFeatureExtractor
         global _worker_whisper_extractor
         _worker_whisper_extractor = WhisperFeatureExtractor.from_pretrained(WHISPER_TEACHER_MODEL)
+    if '_worker_resamplers' not in globals():
+        global _worker_resamplers
+        _worker_resamplers = {}
         
     target_samples = int(1.2 * SR)
     wavs = []
+    
     for item in batch:
         audio = item["audio"]
         wav_t = torch.tensor(audio["array"], dtype=torch.float32)
         in_sr = audio["sampling_rate"]
+        
         if in_sr != SR:
-            wav_t = torchaudio.functional.resample(wav_t, in_sr, SR)
+            import torchaudio
+            if in_sr not in _worker_resamplers:
+                _worker_resamplers[in_sr] = torchaudio.transforms.Resample(in_sr, SR)
+            wav_t = _worker_resamplers[in_sr](wav_t)
+            
         wavs.append(pad_or_trim(wav_t.numpy(), target_samples))
         
     wavs_np = np.stack(wavs, axis=0)
