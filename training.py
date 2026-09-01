@@ -453,7 +453,7 @@ def run_training(
             total_epoch_loss += loss.item()
             
             if step % 25 == 0:
-                cur_temp = SUPCON_INIT_TEMP + (SUPCON_FINAL_TEMP - SUPCON_INIT_TEMP) * warmup_frac if not is_pretrain else SUPCON_FINAL_TEMP
+                cur_temp = SUPCON_INIT_TEMP + (SUPCON_FINAL_TEMP - SUPCON_INIT_TEMP) * warmup_frac if not is_pretrain else SUPCON_INIT_TEMP
                 print(f"Step {step:03d} | Loss: {loss.item():.4f} | Distill: {(loss_wavlm+loss_whisper).item():.3f} | TierC: {loss_tier_c.item():.3f} | Proto: {loss_supcon.item():.3f} | Temp: {cur_temp:.3f}")
                 
         scheduler.step()
