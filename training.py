@@ -471,7 +471,14 @@ def run_training(
                 v_trunc_embed = student(v_trunc, mask=v_mask)
                 
                 val_trunc_loss += truncation_margin_loss(v_embed, v_trunc_embed).item()
-                p_loss, _ = supervised_contrastive_loss(v_embed, v_batch["words"])
+                val_warmup_frac = min(1.0, (max(0, epoch + 1 - pretrain_epochs) * steps_per_epoch) /
+                                      max(1, post_pretrain_epochs * steps_per_epoch))
+                p_loss, _ = supervised_contrastive_loss(
+                    v_embed, v_batch["words"],
+                    temperature=SUPCON_FINAL_TEMP,
+                    init_temperature=SUPCON_INIT_TEMP,
+                    warmup_frac=val_warmup_frac
+                )
                 val_supcon_loss += p_loss.item()
                 val_batches += 1
                 
