@@ -36,7 +36,13 @@ def load_speech_dataset(mswc_split: str, dataset_path: str = None):
         from datasets import load_from_disk
         return load_from_disk(dataset_path)
     from datasets import load_dataset
-    return load_dataset("MLCommons/ml_spoken_words", "en_opus", split=mswc_split, trust_remote_code=True)
+    try:
+        return load_dataset("MLCommons/ml_spoken_words", "en_opus", split=mswc_split, trust_remote_code=True)
+    except RuntimeError as e:
+        if "Dataset scripts are no longer supported" in str(e):
+            print("\n❌ HuggingFace 'datasets' >= 3.0.0 does not support dataset loading scripts.")
+            print("💡 Fix by installing datasets < 3.0.0:\n   pip install \"datasets<3.0.0\"\n")
+        raise e
 
 class MSWCTrainingDataset(Dataset):
     def __init__(self, hf_dataset, noise_clips=None, target_sec=1.2, teacher_targets=None, indices=None):
