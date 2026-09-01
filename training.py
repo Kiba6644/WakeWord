@@ -368,6 +368,9 @@ def run_training(
         is_pretrain = (epoch < pretrain_epochs)
         if epoch == pretrain_epochs:
             print("\n🚀 Pre-training complete! Enabling Supervised Contrastive & Truncation losses...\n")
+            # Reset early stopping metrics because the loss landscape completely changes
+            best_val_loss = float("inf")
+            patience = 0
         total_epoch_loss = 0.0
 
         steps_per_epoch = len(train_loader)
