@@ -17,67 +17,47 @@ from dataset import (MSWCTrainingDataset, collate_fn, load_speech_dataset,
 from losses import truncation_margin_loss, cosine_distillation_loss, supervised_contrastive_loss
 
 def _fast_cache_collate(batch):
-    import torch
+    """Minimal CPU collate — only loads and pads raw audio.
+    Whisper mel extraction is done on the GPU inside precompute_teacher_features.
+    """
     import numpy as np
+    import torch
+    import torchaudio
     from audio_utils import pad_or_trim
-    from config import SR, WHISPER_TEACHER_MODEL
-    
-    global _worker_whisper_extractor, _worker_resamplers
-    if '_worker_whisper_extractor' not in globals():
-        from transformers import WhisperFeatureExtractor
-        global _worker_whisper_extractor
-        _worker_whisper_extractor = WhisperFeatureExtractor.from_pretrained(WHISPER_TEACHER_MODEL)
-    if '_worker_resamplers' not in globals():
-        global _worker_resamplers
-        _worker_resamplers = {}
-        
+    from config import SR
+
     target_samples = int(1.2 * SR)
     wavs = []
-    
     for item in batch:
         audio = item["audio"]
-        wav_t = torch.tensor(audio["array"], dtype=torch.float32)
+        wav = np.array(audio["array"], dtype=np.float32)
         in_sr = audio["sampling_rate"]
-        
         if in_sr != SR:
-            import torchaudio
-            if in_sr not in _worker_resamplers:
-                _worker_resamplers[in_sr] = torchaudio.transforms.Resample(in_sr, SR)
-            wav_t = _worker_resamplers[in_sr](wav_t)
-            
-        wavs.append(pad_or_trim(wav_t.numpy(), target_samples))
-        
-    wavs_np = np.stack(wavs, axis=0)
-    wavs_t = torch.tensor(wavs_np, dtype=torch.float16)
-    
-    # Extract Whisper features in chunks to avoid system OOM
-    wh_features = []
-    chunk_size = 128
-    for i in range(0, len(wavs_np), chunk_size):
-        chunk = list(wavs_np[i:i+chunk_size])
-        feats = _worker_whisper_extractor(chunk, sampling_rate=SR, return_tensors="pt").input_features.half()
-        wh_features.append(feats)
-        
-    wh_inputs = torch.cat(wh_features, dim=0)
-    
-    return wavs_t, wh_inputs
+            wav_t = torch.from_numpy(wav)
+            wav = torchaudio.functional.resample(wav_t, in_sr, SR).numpy()
+        wavs.append(pad_or_trim(wav, target_samples))
+
+    return torch.tensor(np.stack(wavs), dtype=torch.float16)
 
 
-def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device, batch_size=1024,
+def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device, batch_size=512,
                                 cache_dir: str = "./teacher_cache"):
     """
     Max-speed 1-pass teacher embedding cache.
     Optimizations:
     1. Disk cache keyed by (num_samples, wavlm_model, whisper_model) — skips recomputation on restart.
-    2. DataLoader extracts Whisper features in parallel CPU workers
-    3. DataParallel scales across all available GPUs (e.g. 2x T4 on Kaggle)
+    2. CPU workers do ONLY audio loading + resampling (very fast).
+    3. Whisper mel extraction happens on the GPU via torchaudio (eliminates CPU bottleneck).
+    4. DataParallel scales across all available GPUs (e.g. 2x T4 on Kaggle).
     """
     import time
     import os
     import torch
     import torch.nn as nn
+    import torch.nn.functional as F
+    import torchaudio.transforms as T
     from torch.utils.data import DataLoader
-    from transformers import WavLMModel, WhisperModel, WhisperFeatureExtractor
+    from transformers import WavLMModel, WhisperModel
     from config import SR
 
     # ── Disk cache: build a deterministic key ───────────────────────────────
@@ -94,7 +74,7 @@ def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device
         return data
     # ────────────────────────────────────────────────────────────────────────
 
-    print(f"\n⚡ Pre-extracting Teacher Embeddings (Max Speed: Multi-GPU + Multi-Core)...")
+    print(f"\n⚡ Pre-extracting Teacher Embeddings (GPU-accelerated mel, no CPU bottleneck)...")
     print(f"  • WavLM  : {wavlm_model_name}")
     print(f"  • Whisper: {whisper_model_name}")
     print(f"  • Samples: {len(ds):,}   Batch: {batch_size}   GPUs: {torch.cuda.device_count()}")
@@ -111,13 +91,27 @@ def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device
         wavlm = nn.DataParallel(wavlm)
         whisper = nn.DataParallel(whisper)
 
+    # GPU mel-spectrogram transform matching Whisper's preprocessing exactly
+    # (n_fft=400, hop=160, n_mels=80, SR=16000 → 3000 frames per 30s of audio)
+    WHISPER_N_MELS = 80
+    WHISPER_N_FFT  = 400
+    WHISPER_HOP    = 160
+    WHISPER_FRAMES = 3000   # Whisper encoder expects exactly 3000 mel frames
+    WHISPER_AUDIO_LEN = WHISPER_FRAMES * WHISPER_HOP  # 480000 = 30s at 16kHz
+
+    whisper_mel_fn = T.MelSpectrogram(
+        sample_rate=SR, n_fft=WHISPER_N_FFT, hop_length=WHISPER_HOP,
+        n_mels=WHISPER_N_MELS, power=2.0,
+        window_fn=torch.hann_window
+    ).to(device)
+
     workers = min(4, os.cpu_count() or 4)
     loader = DataLoader(
-        ds, 
-        batch_size=batch_size, 
-        collate_fn=_fast_cache_collate, 
-        num_workers=workers, 
-        pin_memory=True, 
+        ds,
+        batch_size=batch_size,
+        collate_fn=_fast_cache_collate,
+        num_workers=workers,
+        pin_memory=True,
         shuffle=False
     )
 
@@ -127,30 +121,51 @@ def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device
     t_start = time.time()
 
     with torch.no_grad():
-        for batch_idx, (wavs_t, wh_inputs) in enumerate(loader):
-            wavs_t = wavs_t.to(device, non_blocking=True)
-            wh_inputs = wh_inputs.to(device, non_blocking=True)
-            
-            # WavLM Inference
+        for batch_idx, wavs_t in enumerate(loader):
+            wavs_t = wavs_t.to(device, non_blocking=True)  # [B, T_short] float16
+
+            # ── WavLM: runs on short (1.2s) audio ──────────────────────────
             w_out = wavlm(wavs_t)
             if hasattr(w_out, 'last_hidden_state'): w_out = w_out.last_hidden_state
             w_out = w_out.mean(dim=1).cpu()
             wavlm_targets.append(w_out)
-            
-            # Whisper Inference
-            wh_out = whisper(wh_inputs)
+
+            # ── Whisper: pad audio to 30s, compute mel ON GPU ──────────────
+            wavs_f = wavs_t.float()   # [B, T_short]
+            pad_len = WHISPER_AUDIO_LEN - wavs_f.shape[1]
+            if pad_len > 0:
+                wavs_f = F.pad(wavs_f, (0, pad_len))
+            else:
+                wavs_f = wavs_f[:, :WHISPER_AUDIO_LEN]
+
+            mel = whisper_mel_fn(wavs_f)   # [B, 80, T_mel]
+
+            # Normalize exactly like HF's WhisperFeatureExtractor
+            log_mel = torch.log10(torch.clamp(mel, min=1e-10))
+            # Per-sample max normalization
+            B = log_mel.shape[0]
+            max_vals = log_mel.view(B, -1).max(dim=1).values.view(B, 1, 1)
+            log_mel = torch.maximum(log_mel, max_vals - 8.0)
+            log_mel = (log_mel + 4.0) / 4.0
+
+            # Whisper encoder strictly expects [B, 80, 3000]
+            if log_mel.shape[2] < WHISPER_FRAMES:
+                log_mel = F.pad(log_mel, (0, WHISPER_FRAMES - log_mel.shape[2]))
+            else:
+                log_mel = log_mel[:, :, :WHISPER_FRAMES]
+
+            wh_out = whisper(log_mel.half())
             if hasattr(wh_out, 'last_hidden_state'): wh_out = wh_out.last_hidden_state
             wh_out = wh_out.mean(dim=1).cpu()
             whisper_targets.append(wh_out)
-            
+
             samples_done = min((batch_idx + 1) * batch_size, num_samples)
-            if (batch_idx + 1) % 1 == 0 or samples_done == num_samples:
-                elapsed = time.time() - t_start
-                rate = samples_done / elapsed
-                remaining = (num_samples - samples_done) / rate if rate > 0 else 0
-                print(f"  ✓ {samples_done:>7,}/{num_samples:,}  "
-                      f"[{elapsed:5.0f}s elapsed | ETA {remaining:5.0f}s | "
-                      f"{rate:6.1f} samples/s]")
+            elapsed = time.time() - t_start
+            rate = samples_done / elapsed
+            remaining = (num_samples - samples_done) / rate if rate > 0 else 0
+            print(f"  ✓ {samples_done:>7,}/{num_samples:,}  "
+                  f"[{elapsed:5.0f}s elapsed | ETA {remaining:5.0f}s | "
+                  f"{rate:6.1f} samples/s]")
 
     # Return to FP32 to match expected model/loss output types
     wavlm_all = torch.cat(wavlm_targets, dim=0).float()
