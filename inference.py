@@ -206,8 +206,9 @@ class WakeWordCascade:
             measured_duration = duration_sec
         metrics["duration_sec"] = measured_duration
 
-        lower_bound = self.mean_duration - self.duration_gate_std_lower * self.std_duration
-        upper_bound = self.mean_duration + self.duration_gate_std_upper * self.std_duration
+        # Relaxed dynamic duration bounds (ignoring strict enrollment speed)
+        lower_bound = 0.25  # Absolute minimum 250ms for a valid wake word
+        upper_bound = 1.60  # Absolute maximum 1.6s
         duration_valid = lower_bound <= measured_duration <= upper_bound
         metrics["duration_valid"] = duration_valid
         metrics["duration_bounds"] = (round(lower_bound, 3), round(upper_bound, 3))
