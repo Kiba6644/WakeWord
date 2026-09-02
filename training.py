@@ -365,6 +365,10 @@ def run_training(
         if 'scheduler_state_dict' in checkpoint:
             scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         print(f"✅ Resumed from checkpoint: Epoch {start_epoch-1} (Val Loss: {best_val_loss:.4f})")
+        
+    if torch.cuda.device_count() > 1:
+        print(f"🔥 Utilizing {torch.cuda.device_count()} GPUs for student model training!")
+        student = nn.DataParallel(student)
     
     # Temperature warm-up schedule for SupCon: high temp early → sharp temp later
     SUPCON_INIT_TEMP  = 0.5   # Start warm (easy gradients, loose clustering)
@@ -501,9 +505,10 @@ def run_training(
             best_val_loss = val_combined
             patience = 0
             print(f"⭐ New Personal Best! Validation Combined Loss dropped to {best_val_loss:.4f}. Saving checkpoint...")
+            model_to_save = student.module if hasattr(student, 'module') else student
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': student.state_dict(),
+                'model_state_dict': model_to_save.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'val_metric': best_val_loss
@@ -516,21 +521,23 @@ def run_training(
                     
     print("Exporting ONNX...")
     best_model_path = os.path.join(output_dir, "best_sota_wakeword_model.pt")
+    model_to_export = student.module if hasattr(student, 'module') else student
+    
     if os.path.exists(best_model_path):
-        student.load_state_dict(torch.load(best_model_path, map_location=device)['model_state_dict'])
+        model_to_export.load_state_dict(torch.load(best_model_path, map_location=device)['model_state_dict'])
     elif resume_path and os.path.exists(resume_path):
-        student.load_state_dict(torch.load(resume_path, map_location=device)['model_state_dict'])
+        model_to_export.load_state_dict(torch.load(resume_path, map_location=device)['model_state_dict'])
     else:
         print("⚠️ Warning: No best model found on disk, exporting final epoch weights...")
     
-    student.eval()
+    model_to_export.eval()
     
     dummy_input = torch.randn(1, 1, int(1.2 * SR / 160), 40).to(device)
     onnx_path = os.path.join(output_dir, "wakeword_student.onnx")
     
     try:
         torch.onnx.export(
-            student, dummy_input, onnx_path,
+            model_to_export, dummy_input, onnx_path,
             export_params=True, opset_version=18, do_constant_folding=True,
             input_names=['input_mel'], output_names=['embedding'],
             dynamic_axes={'input_mel': {0: 'batch_size', 2: 'time'}, 'embedding': {0: 'batch_size'}}
