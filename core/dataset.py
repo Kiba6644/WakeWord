@@ -1,4 +1,6 @@
 import os
+import sys
+import subprocess
 import random
 import numpy as np
 import torch
@@ -62,7 +64,6 @@ class MSWCTrainingDataset(Dataset):
         if not os.path.exists(hey_dir) or not glob.glob(os.path.join(hey_dir, "*.wav")):
             print("📣 'hey_clips' directory missing or empty. Auto-generating synthetic phrase clips...")
             try:
-                import subprocess
                 subprocess.run([sys.executable, "scripts/generate_hey_clips.py", "--output_dir", hey_dir, "--count", "120"], check=False)
             except Exception as e:
                 print(f"⚠️ Could not auto-generate hey clips: {e}")

@@ -4,6 +4,17 @@ import re
 import torch
 import torch.nn.functional as F
 import torchaudio.transforms as T
+import nltk
+for res in ['taggers/averaged_perceptron_tagger_eng', 'taggers/averaged_perceptron_tagger', 'corpora/cmudict']:
+    try:
+        nltk.data.find(res)
+    except LookupError:
+        try:
+            name = res.split('/')[-1]
+            nltk.download(name, quiet=True)
+        except Exception:
+            pass
+
 from g2p_en import G2p
 from .config import MAX_CLIP_SEC, MIN_CLIP_SEC, NUM_TEMPORAL_SEGMENTS, NUM_PHONEMES
 
