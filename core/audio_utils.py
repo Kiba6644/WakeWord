@@ -1,7 +1,7 @@
 import numpy as np
 import logging
 import re
-from config import MAX_CLIP_SEC, MIN_CLIP_SEC, NUM_TEMPORAL_SEGMENTS, NUM_PHONEMES
+from .config import MAX_CLIP_SEC, MIN_CLIP_SEC, NUM_TEMPORAL_SEGMENTS, NUM_PHONEMES
 
 logger = logging.getLogger(__name__)
 

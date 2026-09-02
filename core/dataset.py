@@ -8,10 +8,10 @@ from torch.utils.data import Dataset, DataLoader, DistributedSampler
 from collections import defaultdict
 import glob
 
-from config import (SR, N_MELS, N_FFT, HOP_LENGTH, MIN_CLIP_SEC, MAX_CLIP_SEC, 
+from .config import (SR, N_MELS, N_FFT, HOP_LENGTH, MIN_CLIP_SEC, MAX_CLIP_SEC, 
                     TEMPO_AUG_FACTORS, PHONETIC_HARD_NEGATIVE_RATIO, 
                     BATCH_SIZE, MSWC_SPLIT)
-from audio_utils import (create_truncated_clip, time_stretch_audio, phonetic_distance,
+from .audio_utils import (create_truncated_clip, time_stretch_audio, phonetic_distance,
                          pad_or_trim, word_to_phoneme_tokens)
 
 def load_background_noise_bank(noise_dir: str) -> list[np.ndarray]:

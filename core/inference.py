@@ -7,11 +7,11 @@ import onnxruntime as ort
 from onnxruntime.quantization import quantize_dynamic, QuantType
 import torchaudio.transforms as T
 
-from config import (SR, N_MELS, EMBED_DIM, TEMPO_AUG_FACTORS,
+from .config import (SR, N_MELS, EMBED_DIM, TEMPO_AUG_FACTORS,
                     NUM_TEMPORAL_SEGMENTS, SUFFIX_REJECTION_THRESHOLD,
                     CTC_POSTERIOR_THRESHOLD, N_FFT, HOP_LENGTH,
                     DURATION_GATE_STD_LOWER, DURATION_GATE_STD_UPPER)
-from audio_utils import (time_stretch_audio, create_truncated_clip,
+from .audio_utils import (time_stretch_audio, create_truncated_clip,
                          slice_temporal_segments, generate_phonetic_minimal_pairs)
 
 

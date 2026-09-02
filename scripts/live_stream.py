@@ -8,6 +8,9 @@ Real-Time Continuous Live Microphone Stream for Wake Word Engine
 
 import os
 import sys
+import os
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
 import time
 import json
 import numpy as np
@@ -27,17 +30,18 @@ except ImportError:
     print("\n⚠️  'onnxruntime' is required. Install with:")
     print("   pip install onnxruntime\n")
 
-from config import SR, N_MELS, N_FFT, HOP_LENGTH, EMBED_DIM, STAGE2_GLOBAL_THRESHOLD, SUFFIX_REJECTION_THRESHOLD
-from audio_utils import endpoint_utterance, time_stretch_audio, generate_phonetic_minimal_pairs
-from inference import WakeWordCascade
+from core.config import SR, N_MELS, N_FFT, HOP_LENGTH, EMBED_DIM, STAGE2_GLOBAL_THRESHOLD, SUFFIX_REJECTION_THRESHOLD
+from core.audio_utils import endpoint_utterance, time_stretch_audio, generate_phonetic_minimal_pairs
+from core.inference import WakeWordCascade
 
 PROFILE_PATH = "wakeword_profile.json"
 DEFAULT_MODEL_PATH = "wakeword_student.onnx"
 
 class LiveWakeWordEngine:
-    def __init__(self, model_path=DEFAULT_MODEL_PATH, phrase="Hey Karthika"):
+    def __init__(self, model_path=DEFAULT_MODEL_PATH, phrase="Hey Karthika", debug=False):
         self.model_path = model_path
         self.phrase = phrase
+        self.debug = debug
         self.sr = SR
         self.cascade = WakeWordCascade(
             stage1_path="", 
@@ -182,16 +186,25 @@ class LiveWakeWordEngine:
                         if "rejection_reason" in metrics:
                             status = metrics["rejection_reason"]
                         dur_str = f"{metrics.get('duration_sec_measured', metrics.get('duration_sec', 0.0)):.2f}s"
-                        sys.stdout.write(f"\r[ {bar} ] {prob:5.1f}% | Sim: {similarity:.4f} | Suf: {suffix_sim:.4f} | dB: {db:5.1f} | Dur: {dur_str} | ({status})    ")
-                        sys.stdout.flush()
+                        
+                        log_str = f"[ {bar} ] {prob:5.1f}% | Sim: {similarity:.4f} | Suf: {suffix_sim:.4f} | dB: {db:5.1f} | Dur: {dur_str} | ({status})"
+                        if hasattr(self, 'debug') and self.debug:
+                            print(log_str)
+                        else:
+                            sys.stdout.write(f"\r{log_str}    ")
+                            sys.stdout.flush()
 
         except KeyboardInterrupt:
             print("\n\n🛑 Live streaming stopped by user.")
 
 if __name__ == "__main__":
-    wake_phrase = sys.argv[1] if len(sys.argv) > 1 else "Hey Karthika"
-    thresh = float(sys.argv[2]) if len(sys.argv) > 2 else 0.96
-    engine = LiveWakeWordEngine(phrase=wake_phrase)
+    debug_mode = "--debug" in sys.argv
+    args = [arg for arg in sys.argv[1:] if arg != "--debug"]
+    
+    wake_phrase = args[0] if len(args) > 0 else "Hey Karthika"
+    thresh = float(args[1]) if len(args) > 1 else 0.96
+    
+    engine = LiveWakeWordEngine(phrase=wake_phrase, debug=debug_mode)
     engine.cascade.threshold2 = thresh
-    print(f"🔧 Configured Detection Threshold: {thresh}")
+    print(f"🔧 Configured Detection Threshold: {thresh} | Debug: {debug_mode}")
     engine.run_live_stream()

@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from config import (EMBED_DIM, STAGE2_CHANNELS, NUM_ATTENTION_HEADS, 
+from .config import (EMBED_DIM, STAGE2_CHANNELS, NUM_ATTENTION_HEADS, 
                     WAVLM_EMBED_DIM, WHISPER_EMBED_DIM, NUM_PHONEMES)
 
 class SqueezeExcitation(nn.Module):

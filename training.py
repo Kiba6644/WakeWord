@@ -8,13 +8,13 @@ from torch.utils.data import DataLoader
 from torch.amp import autocast, GradScaler
 from torch.optim.lr_scheduler import LambdaLR
 
-from config import (SR, WARMUP_EPOCHS, PRETRAIN_EPOCHS, MIN_LR, GRAD_CLIP_NORM,
+from core.config import (SR, WARMUP_EPOCHS, PRETRAIN_EPOCHS, MIN_LR, GRAD_CLIP_NORM,
                     TRUNCATION_AUX_WEIGHT, WAVLM_DISTILL_WEIGHT, 
                     WHISPER_DISTILL_WEIGHT, CTC_LOSS_WEIGHT, MSWC_SPLIT)
-from model import WakeWordModel
-from dataset import (MSWCTrainingDataset, collate_fn, load_speech_dataset, 
+from core.model import WakeWordModel
+from core.dataset import (MSWCTrainingDataset, collate_fn, load_speech_dataset, 
                      load_background_noise_bank)
-from losses import truncation_margin_loss, cosine_distillation_loss, supervised_contrastive_loss
+from core.losses import truncation_margin_loss, cosine_distillation_loss, supervised_contrastive_loss
 
 def _fast_cache_collate(batch):
     """Minimal CPU collate — only loads and pads raw audio.
@@ -23,8 +23,8 @@ def _fast_cache_collate(batch):
     import numpy as np
     import torch
     import torchaudio
-    from audio_utils import pad_or_trim
-    from config import SR
+    from core.audio_utils import pad_or_trim
+    from core.config import SR
 
     target_samples = int(1.2 * SR)
     wavs = []
@@ -58,7 +58,7 @@ def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device
     import torchaudio.transforms as T
     from torch.utils.data import DataLoader
     from transformers import WavLMModel, WhisperModel
-    from config import SR
+    from core.config import SR
 
     # ── Disk cache: build a deterministic key ───────────────────────────────
     try:
