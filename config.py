@@ -31,7 +31,7 @@ TRUNCATION_FRACTION_PER_EPISODE = 0.5
 # SOTA: Dual-Teacher Distillation (WavLM + Whisper)
 WAVLM_TEACHER_MODEL = "microsoft/wavlm-large"  # 1024D Phonetic specialist
 WAVLM_EMBED_DIM = 1024
-WAVLM_DISTILL_WEIGHT = 0.4
+WAVLM_DISTILL_WEIGHT = 0.1  # Massively dropped to prevent speaker overfitting (from 0.4)
 
 WHISPER_TEACHER_MODEL = "openai/whisper-base"  # 512D Noise/Ambient specialist
 WHISPER_EMBED_DIM = 512

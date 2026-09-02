@@ -369,7 +369,7 @@ def run_training(
     # Temperature warm-up schedule for SupCon: high temp early → sharp temp later
     SUPCON_INIT_TEMP  = 0.5   # Start warm (easy gradients, loose clustering)
     SUPCON_FINAL_TEMP = 0.07  # End sharp (tight clustering)
-    SUPCON_WEIGHT     = 0.5   # Down-weight so SupCon doesn't drown distillation
+    SUPCON_WEIGHT     = 1.0   # Raised to 1.0 to force phoneme clustering over acoustics
     post_pretrain_epochs = max(1, epochs - pretrain_epochs)
 
     for epoch in range(start_epoch, epochs):
@@ -462,26 +462,30 @@ def run_training(
         val_supcon_loss = 0.0
         val_batches = 0
         
-        with torch.no_grad():
+        with torch.no_grad(), autocast('cuda'):
             for v_batch in val_loader:
-                v_mels = v_batch["mels"].to(device)
-                v_trunc = v_batch["trunc_mels"].to(device)
+                v_mels = v_batch["mels"].to(device, non_blocking=True)
+                v_trunc = v_batch["trunc_mels"].to(device, non_blocking=True)
                 v_energy = v_mels.mean(dim=-1).squeeze(1)
                 v_mask = v_energy > -10.0
                 
                 v_embed = student(v_mels, mask=v_mask)
                 v_trunc_embed = student(v_trunc, mask=v_mask)
                 
-                val_trunc_loss += truncation_margin_loss(v_embed, v_trunc_embed).item()
+                v_trunc_loss = truncation_margin_loss(v_embed, v_trunc_embed)
+                
                 val_warmup_frac = min(1.0, (max(0, epoch + 1 - pretrain_epochs) * steps_per_epoch) /
                                       max(1, post_pretrain_epochs * steps_per_epoch))
-                p_loss, _ = supervised_contrastive_loss(
+                cur_val_temp = SUPCON_INIT_TEMP + (SUPCON_FINAL_TEMP - SUPCON_INIT_TEMP) * val_warmup_frac
+                v_supcon, _ = supervised_contrastive_loss(
                     v_embed, v_batch["words"],
-                    temperature=SUPCON_FINAL_TEMP,
-                    init_temperature=SUPCON_INIT_TEMP,
-                    warmup_frac=val_warmup_frac
+                    temperature=cur_val_temp,
+                    init_temperature=None,
+                    warmup_frac=0.0
                 )
-                val_supcon_loss += p_loss.item()
+                
+                val_trunc_loss += v_trunc_loss.item()
+                val_supcon_loss += v_supcon.item()
                 val_batches += 1
                 
         if val_batches > 0:
@@ -496,6 +500,7 @@ def run_training(
         if val_combined < best_val_loss:
             best_val_loss = val_combined
             patience = 0
+            print(f"⭐ New Personal Best! Validation Combined Loss dropped to {best_val_loss:.4f}. Saving checkpoint...")
             torch.save({
                 'epoch': epoch,
                 'model_state_dict': student.state_dict(),
