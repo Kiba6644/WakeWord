@@ -515,7 +515,14 @@ def run_training(
                     break
                     
     print("Exporting ONNX...")
-    student.load_state_dict(torch.load(os.path.join(output_dir, "best_sota_wakeword_model.pt"), map_location=device)['model_state_dict'])
+    best_model_path = os.path.join(output_dir, "best_sota_wakeword_model.pt")
+    if os.path.exists(best_model_path):
+        student.load_state_dict(torch.load(best_model_path, map_location=device)['model_state_dict'])
+    elif resume_path and os.path.exists(resume_path):
+        student.load_state_dict(torch.load(resume_path, map_location=device)['model_state_dict'])
+    else:
+        print("⚠️ Warning: No best model found on disk, exporting final epoch weights...")
+    
     student.eval()
     
     dummy_input = torch.randn(1, 1, int(1.2 * SR / 160), 40).to(device)
