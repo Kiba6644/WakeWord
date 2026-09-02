@@ -1,4 +1,5 @@
 import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:128"
 import math
 import argparse
 import numpy as np
@@ -10,16 +11,15 @@ from torch.optim.lr_scheduler import LambdaLR
 
 from core.config import (SR, WARMUP_EPOCHS, PRETRAIN_EPOCHS, MIN_LR, GRAD_CLIP_NORM,
                     TRUNCATION_AUX_WEIGHT, WAVLM_DISTILL_WEIGHT, 
-                    WHISPER_DISTILL_WEIGHT, CTC_LOSS_WEIGHT, MSWC_SPLIT)
+                    WHISPER_DISTILL_WEIGHT, CTC_LOSS_WEIGHT, MSWC_SPLIT,
+                    SUFFIX_SUPCON_WEIGHT, PHONETIC_HARD_NEGATIVE_RATIO, N_MELS)
 from core.model import WakeWordModel
 from core.dataset import (MSWCTrainingDataset, collate_fn, load_speech_dataset, 
                      load_background_noise_bank)
 from core.losses import truncation_margin_loss, cosine_distillation_loss, supervised_contrastive_loss
 
 def _fast_cache_collate(batch):
-    """Minimal CPU collate — only loads and pads raw audio.
-    Whisper mel extraction is done on the GPU inside precompute_teacher_features.
-    """
+    """Minimal CPU collate — only loads and pads raw audio."""
     import numpy as np
     import torch
     import torchaudio
@@ -42,14 +42,7 @@ def _fast_cache_collate(batch):
 
 def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device, batch_size=512,
                                 cache_dir: str = "./teacher_cache"):
-    """
-    Max-speed 1-pass teacher embedding cache.
-    Optimizations:
-    1. Disk cache keyed by (num_samples, wavlm_model, whisper_model) — skips recomputation on restart.
-    2. CPU workers do ONLY audio loading + resampling (very fast).
-    3. Whisper mel extraction happens on the GPU via torchaudio (eliminates CPU bottleneck).
-    4. DataParallel scales across all available GPUs (e.g. 2x T4 on Kaggle).
-    """
+    """Max-speed 1-pass teacher embedding cache."""
     import time
     import os
     import torch
@@ -60,11 +53,10 @@ def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device
     from transformers import WavLMModel, WhisperModel
     from core.config import SR
 
-    # ── Disk cache: build a deterministic key ───────────────────────────────
     try:
         os.makedirs(cache_dir, exist_ok=True)
     except OSError:
-        pass  # E.g. Kaggle /kaggle/input/ is read-only, which is fine if reading an existing cache
+        pass
     _wlm_tag = wavlm_model_name.replace("/", "_")
     _wh_tag  = whisper_model_name.replace("/", "_")
     cache_path = os.path.join(cache_dir, f"teacher_{len(ds)}_{_wlm_tag}_{_wh_tag}.pt")
@@ -75,7 +67,6 @@ def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device
         print(f"✅ Cache loaded — {len(ds):,} samples  "
               f"(wavlm {tuple(data['wavlm'].shape)}, whisper {tuple(data['whisper'].shape)})")
         return data
-    # ────────────────────────────────────────────────────────────────────────
 
     print(f"\n⚡ Pre-extracting Teacher Embeddings (GPU-accelerated mel, no CPU bottleneck)...")
     print(f"  • WavLM  : {wavlm_model_name}")
@@ -94,13 +85,11 @@ def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device
         wavlm = nn.DataParallel(wavlm)
         whisper = nn.DataParallel(whisper)
 
-    # GPU mel-spectrogram transform matching Whisper's preprocessing exactly
-    # (n_fft=400, hop=160, n_mels=80, SR=16000 → 3000 frames per 30s of audio)
     WHISPER_N_MELS = 80
     WHISPER_N_FFT  = 400
     WHISPER_HOP    = 160
-    WHISPER_FRAMES = 3000   # Whisper encoder expects exactly 3000 mel frames
-    WHISPER_AUDIO_LEN = WHISPER_FRAMES * WHISPER_HOP  # 480000 = 30s at 16kHz
+    WHISPER_FRAMES = 3000
+    WHISPER_AUDIO_LEN = WHISPER_FRAMES * WHISPER_HOP
 
     whisper_mel_fn = T.MelSpectrogram(
         sample_rate=SR, n_fft=WHISPER_N_FFT, hop_length=WHISPER_HOP,
@@ -125,33 +114,28 @@ def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device
 
     with torch.no_grad():
         for batch_idx, wavs_t in enumerate(loader):
-            wavs_t = wavs_t.to(device, non_blocking=True)  # [B, T_short] float16
+            wavs_t = wavs_t.to(device, non_blocking=True)
 
-            # ── WavLM: runs on short (1.2s) audio ──────────────────────────
             w_out = wavlm(wavs_t)
             if hasattr(w_out, 'last_hidden_state'): w_out = w_out.last_hidden_state
             w_out = w_out.mean(dim=1).cpu()
             wavlm_targets.append(w_out)
 
-            # ── Whisper: pad audio to 30s, compute mel ON GPU ──────────────
-            wavs_f = wavs_t.float()   # [B, T_short]
+            wavs_f = wavs_t.float()
             pad_len = WHISPER_AUDIO_LEN - wavs_f.shape[1]
             if pad_len > 0:
                 wavs_f = F.pad(wavs_f, (0, pad_len))
             else:
                 wavs_f = wavs_f[:, :WHISPER_AUDIO_LEN]
 
-            mel = whisper_mel_fn(wavs_f)   # [B, 80, T_mel]
+            mel = whisper_mel_fn(wavs_f)
 
-            # Normalize exactly like HF's WhisperFeatureExtractor
             log_mel = torch.log10(torch.clamp(mel, min=1e-10))
-            # Per-sample max normalization
             B = log_mel.shape[0]
             max_vals = log_mel.reshape(B, -1).max(dim=1).values.reshape(B, 1, 1)
             log_mel = torch.maximum(log_mel, max_vals - 8.0)
             log_mel = (log_mel + 4.0) / 4.0
 
-            # Whisper encoder strictly expects [B, 80, 3000]
             if log_mel.shape[2] < WHISPER_FRAMES:
                 log_mel = F.pad(log_mel, (0, WHISPER_FRAMES - log_mel.shape[2]))
             else:
@@ -170,7 +154,6 @@ def precompute_teacher_features(ds, wavlm_model_name, whisper_model_name, device
                   f"[{elapsed:5.0f}s elapsed | ETA {remaining:5.0f}s | "
                   f"{rate:6.1f} samples/s]")
 
-    # Return to FP32 to match expected model/loss output types
     wavlm_all = torch.cat(wavlm_targets, dim=0).float()
     whisper_all = torch.cat(whisper_targets, dim=0).float()
 
@@ -205,12 +188,10 @@ class WordBalancedBatchSampler(Sampler):
         print("🔍 Grouping dataset by words for contrastive sampling...")
         self.word_to_indices = defaultdict(list)
         
-        # ms_dataset is MSWCTrainingDataset, ms_dataset.dataset is a Subset
         subset = ms_dataset.dataset
         hf_dataset = subset.dataset
         indices = subset.indices
         
-        # Pre-fetch words to avoid slow item-by-item loading if possible
         word_key = None
         if hasattr(hf_dataset, "column_names"):
             for key in ["keyword", "word", "label"]:
@@ -234,10 +215,15 @@ class WordBalancedBatchSampler(Sampler):
                 
         self.valid_words = [w for w, idxs in self.word_to_indices.items() if len(idxs) >= self.samples_per_word]
         print(f"✅ Found {len(self.valid_words)} distinct words with >= {self.samples_per_word} samples.")
+        
+        self.code_to_words = defaultdict(list)
+        from core.audio_utils import get_phonetic_code
+        for w in self.valid_words:
+            code = get_phonetic_code(w)
+            self.code_to_words[code].append(w)
 
     def __iter__(self):
         if not self.valid_words:
-            # Fallback to random if dataset is completely scattered
             for _ in range(len(self)):
                 yield random.sample(range(len(self.dataset)), self.batch_size)
             return
@@ -246,18 +232,34 @@ class WordBalancedBatchSampler(Sampler):
         num_batches = len(self)
         
         for _ in range(num_batches):
+            if not word_pool:
+                word_pool = list(self.valid_words)
             random.shuffle(word_pool)
             batch = []
             
-            # Keep pulling words until batch is full
-            for word in word_pool:
-                idxs = random.sample(self.word_to_indices[word], self.samples_per_word)
+            target_word = word_pool.pop()
+            from core.audio_utils import get_phonetic_code
+            target_code = get_phonetic_code(target_word)
+            
+            batch_words = [target_word]
+            
+            num_phonetic = int( (self.batch_size // self.samples_per_word) * PHONETIC_HARD_NEGATIVE_RATIO )
+            similar_words = [w for w in self.code_to_words.get(target_code, []) if w != target_word]
+            random.shuffle(similar_words)
+            batch_words.extend(similar_words[:num_phonetic])
+            
+            rem = (self.batch_size // self.samples_per_word) - len(batch_words)
+            if rem > 0 and word_pool:
+                random.shuffle(word_pool)
+                batch_words.extend(word_pool[:rem])
+                
+            for w in batch_words:
+                idxs = random.sample(self.word_to_indices[w], self.samples_per_word)
                 batch.extend(idxs)
-                if len(batch) >= self.batch_size:
-                    break
-                    
-            random.shuffle(batch)
-            yield batch[:self.batch_size]
+                
+            if len(batch) > self.batch_size:
+                batch = batch[:self.batch_size]
+            yield batch
 
     def __len__(self):
         return len(self.dataset) // self.batch_size
@@ -267,7 +269,7 @@ def run_training(
     output_dir: str = "./output",
     dataset_path: str = None,
     resume_path: str = None,
-    mswc_split: str = "train[:10000]",
+    mswc_split: str = MSWC_SPLIT,
     max_train_samples: int = None,
     pretrain_epochs: int = PRETRAIN_EPOCHS,
     epochs: int = 50,
@@ -283,6 +285,10 @@ def run_training(
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     os.makedirs(output_dir, exist_ok=True)
     
+    if torch.cuda.is_available():
+        vram_gb = torch.cuda.get_device_properties(0).total_memory / (1024**3)
+        print(f"🎮 GPU Detected: {torch.cuda.get_device_name(0)} ({vram_gb:.2f} GB Dedicated VRAM)")
+    
     ds = load_speech_dataset(mswc_split, dataset_path=dataset_path)
     noise_bank = load_background_noise_bank(noise_dir)
     
@@ -291,13 +297,18 @@ def run_training(
         teacher_targets = precompute_teacher_features(ds, wavlm_model, whisper_model, device, batch_size=512,
                                                       cache_dir=teacher_cache_dir)
     
-    # Slice dataset AFTER loading the cache (cache key uses full len(ds))
-    # This lets you train on a subset while still reusing the full precomputed cache.
     if max_train_samples is not None and max_train_samples < len(ds):
         print(f"📦 Slicing dataset: using first {max_train_samples:,} of {len(ds):,} samples")
         ds = ds.select(range(max_train_samples))
         if teacher_targets is not None:
             teacher_targets = {k: v[:max_train_samples] for k, v in teacher_targets.items()}
+            
+    if teacher_targets is not None:
+        print("🚀 Moving teacher target matrix directly onto GPU VRAM for 0-RAM overhead & max speed...")
+        teacher_targets = {
+            "wavlm": teacher_targets["wavlm"].to(device, non_blocking=True),
+            "whisper": teacher_targets["whisper"].to(device, non_blocking=True)
+        }
     
     train_size = int(0.9 * len(ds))
     val_size = len(ds) - train_size
@@ -370,10 +381,9 @@ def run_training(
         print(f"🔥 Utilizing {torch.cuda.device_count()} GPUs for student model training!")
         student = nn.DataParallel(student)
     
-    # Temperature warm-up schedule for SupCon: high temp early → sharp temp later
-    SUPCON_INIT_TEMP  = 0.5   # Start warm (easy gradients, loose clustering)
-    SUPCON_FINAL_TEMP = 0.07  # End sharp (tight clustering)
-    SUPCON_WEIGHT     = 1.0   # Raised to 1.0 to force phoneme clustering over acoustics
+    SUPCON_INIT_TEMP  = 0.5
+    SUPCON_FINAL_TEMP = 0.07
+    SUPCON_WEIGHT     = 1.0
     post_pretrain_epochs = max(1, epochs - pretrain_epochs)
 
     for epoch in range(start_epoch, epochs):
@@ -381,23 +391,31 @@ def run_training(
         is_pretrain = (epoch < pretrain_epochs)
         if epoch == pretrain_epochs:
             print("\n🚀 Pre-training complete! Enabling Supervised Contrastive & Truncation losses...\n")
-            # Reset early stopping metrics because the loss landscape completely changes
             best_val_loss = float("inf")
             patience = 0
         total_epoch_loss = 0.0
-
         steps_per_epoch = len(train_loader)
-        # Fraction of post-pretrain training completed (0 → 1)
         post_pretrain_step_offset = max(0, epoch - pretrain_epochs) * steps_per_epoch
+        import time
+        epoch_start_time = time.time()
+        last_interval_time = epoch_start_time
+        last_interval_samples = 0
+        samples_processed = 0
 
         for step, batch in enumerate(train_loader):
             optimizer.zero_grad(set_to_none=True)
             
             mels = batch["mels"].to(device, non_blocking=True)
             trunc_mels = batch["trunc_mels"].to(device, non_blocking=True)
+            samples_processed += mels.size(0)
+            last_interval_samples += mels.size(0)
             energy = mels.mean(dim=-1).squeeze(1)
             attention_mask = energy > -10.0
-            if "wavlm_targets" in batch:
+            if teacher_targets is not None and "sample_idxs" in batch:
+                sample_idxs = batch["sample_idxs"].to(device, non_blocking=True)
+                wavlm_target = teacher_targets["wavlm"][sample_idxs]
+                whisper_target = teacher_targets["whisper"][sample_idxs]
+            elif "wavlm_targets" in batch:
                 wavlm_target = batch["wavlm_targets"].to(device, non_blocking=True)
                 whisper_target = batch["whisper_targets"].to(device, non_blocking=True)
             else:
@@ -413,7 +431,7 @@ def run_training(
                     whisper_target = whisper_out.mean(dim=1)
             
             with autocast('cuda'):
-                norm_embed, (s_wavlm_proj, s_whisper_proj), ctc_logits = student(mels, mask=attention_mask, return_distill=True)
+                global_embed, suffix_embed, (s_wavlm_proj, s_whisper_proj), ctc_logits = student(mels, mask=attention_mask, return_distill=True, return_suffix=True)
                 trunc_embed = student(trunc_mels, mask=attention_mask)
                 
                 loss_wavlm = cosine_distillation_loss(s_wavlm_proj, wavlm_target)
@@ -425,22 +443,30 @@ def run_training(
                     input_lengths, batch["target_lengths"].to(device)
                 )
                 
-                loss_tier_c = truncation_margin_loss(norm_embed, trunc_embed)
+                loss_tier_c = truncation_margin_loss(global_embed, trunc_embed)
 
-                # Compute warmup_frac for temperature schedule
-                warmup_frac = min(1.0, (post_pretrain_step_offset + step) /
-                                  (post_pretrain_epochs * steps_per_epoch))
-                loss_supcon, p_acc = supervised_contrastive_loss(
-                    norm_embed, batch["words"],
-                    temperature=SUPCON_FINAL_TEMP,
-                    init_temperature=SUPCON_INIT_TEMP,
-                    warmup_frac=warmup_frac,
-                )
-                
                 if is_pretrain:
                     loss = (WAVLM_DISTILL_WEIGHT * loss_wavlm) + (WHISPER_DISTILL_WEIGHT * loss_whisper) + (CTC_LOSS_WEIGHT * loss_ctc)
+                    loss_supcon_global = torch.tensor(0.0)
+                    loss_supcon_suffix = torch.tensor(0.0)
                 else:
-                    loss = (SUPCON_WEIGHT * loss_supcon +
+                    warmup_frac = min(1.0, (post_pretrain_step_offset + step) /
+                                      (post_pretrain_epochs * steps_per_epoch))
+                    loss_supcon_global, p_acc = supervised_contrastive_loss(
+                        global_embed, batch["words"],
+                        temperature=SUPCON_FINAL_TEMP,
+                        init_temperature=SUPCON_INIT_TEMP,
+                        warmup_frac=warmup_frac,
+                    )
+                    loss_supcon_suffix, _ = supervised_contrastive_loss(
+                        suffix_embed, batch["words"],
+                        temperature=0.07,
+                        init_temperature=None,
+                        warmup_frac=0.0,
+                    )
+                    
+                    loss = (SUPCON_WEIGHT * loss_supcon_global +
+                            SUFFIX_SUPCON_WEIGHT * loss_supcon_suffix +
                             (TRUNCATION_AUX_WEIGHT * loss_tier_c) + 
                             (WAVLM_DISTILL_WEIGHT * loss_wavlm) + 
                             (WHISPER_DISTILL_WEIGHT * loss_whisper) + 
@@ -454,9 +480,15 @@ def run_training(
             
             total_epoch_loss += loss.item()
             
-            if step % 25 == 0:
-                cur_temp = SUPCON_INIT_TEMP + (SUPCON_FINAL_TEMP - SUPCON_INIT_TEMP) * warmup_frac if not is_pretrain else SUPCON_INIT_TEMP
-                print(f"Step {step:03d} | Loss: {loss.item():.4f} | Distill: {(loss_wavlm+loss_whisper).item():.3f} | TierC: {loss_tier_c.item():.3f} | Proto: {loss_supcon.item():.3f} | Temp: {cur_temp:.3f}")
+            if step % 25 == 0 or step == steps_per_epoch - 1:
+                now = time.time()
+                interval_elapsed = now - last_interval_time
+                samples_per_sec = last_interval_samples / interval_elapsed if interval_elapsed > 0 else 0
+                ms_per_step = (interval_elapsed / max(1, (25 if step % 25 == 0 and step > 0 else 1))) * 1000.0
+                last_interval_time = now
+                last_interval_samples = 0
+                cur_temp = SUPCON_INIT_TEMP + (SUPCON_FINAL_TEMP - SUPCON_INIT_TEMP) * (min(1.0, (post_pretrain_step_offset + step) / (post_pretrain_epochs * steps_per_epoch))) if not is_pretrain else SUPCON_INIT_TEMP
+                print(f"Step {step:03d}/{steps_per_epoch:03d} | Speed: {samples_per_sec:6.1f} samples/s ({ms_per_step:5.1f} ms/step) | Loss: {loss.item():.4f} | Distill: {(loss_wavlm+loss_whisper).item():.3f} | TierC: {loss_tier_c.item():.3f} | Proto: {loss_supcon_global.item():.3f}")
                 
         scheduler.step()
         avg_train_loss = total_epoch_loss / len(train_loader)
@@ -467,14 +499,19 @@ def run_training(
         val_batches = 0
         
         with torch.no_grad(), autocast('cuda'):
-            for v_batch in val_loader:
+            for v_idx, v_batch in enumerate(val_loader):
+                if v_idx >= 15:  # Cap at 15 batches (~1,000 samples) for ultra-fast sub-2s evaluation
+                    break
                 v_mels = v_batch["mels"].to(device, non_blocking=True)
                 v_trunc = v_batch["trunc_mels"].to(device, non_blocking=True)
-                v_energy = v_mels.mean(dim=-1).squeeze(1)
+                
+                # Single batched GPU forward pass for mels + trunc_mels (2x speedup)
+                combined_mels = torch.cat([v_mels, v_trunc], dim=0)
+                v_energy = combined_mels.mean(dim=-1).squeeze(1)
                 v_mask = v_energy > -10.0
                 
-                v_embed = student(v_mels, mask=v_mask)
-                v_trunc_embed = student(v_trunc, mask=v_mask)
+                combined_embeds = student(combined_mels, mask=v_mask)
+                v_embed, v_trunc_embed = combined_embeds.chunk(2, dim=0)
                 
                 v_trunc_loss = truncation_margin_loss(v_embed, v_trunc_embed)
                 
@@ -496,7 +533,6 @@ def run_training(
             val_trunc_loss /= val_batches
             val_supcon_loss /= val_batches
         
-        # Weight the validation metric exactly as they are weighted in training
         val_combined = (TRUNCATION_AUX_WEIGHT * val_trunc_loss) + (SUPCON_WEIGHT * val_supcon_loss)
         
         print(f"Epoch {epoch+1} Done | Train Loss: {avg_train_loss:.4f} | Val Trunc: {val_trunc_loss:.4f} | Val SupCon: {val_supcon_loss:.4f} | Val Combined: {val_combined:.4f}")
@@ -532,21 +568,30 @@ def run_training(
     
     model_to_export.eval()
     
-    dummy_input = torch.randn(1, 1, int(1.2 * SR / 160), 40).to(device)
+    dummy_input = torch.randn(1, 1, int(1.2 * SR / 160), N_MELS).to(device)
     onnx_path = os.path.join(output_dir, "wakeword_student.onnx")
     
+    class ONNXWrapper(nn.Module):
+        def __init__(self, model):
+            super().__init__()
+            self.model = model
+        def forward(self, x):
+            return self.model(x, return_ctc=True, return_suffix=True)
+            
     try:
         torch.onnx.export(
-            model_to_export, dummy_input, onnx_path,
+            ONNXWrapper(model_to_export), dummy_input, onnx_path,
             export_params=True, opset_version=18, do_constant_folding=True,
-            input_names=['input_mel'], output_names=['embedding'],
-            dynamic_axes={'input_mel': {0: 'batch_size', 2: 'time'}, 'embedding': {0: 'batch_size'}}
+            input_names=['input_mel'], output_names=['embedding', 'suffix_embed', 'ctc_logits'],
+            dynamic_axes={'input_mel': {0: 'batch_size', 2: 'time'}, 
+                          'embedding': {0: 'batch_size'},
+                          'suffix_embed': {0: 'batch_size'},
+                          'ctc_logits': {0: 'batch_size', 1: 'time'}}
         )
         print(f"ONNX Exported: {onnx_path}")
     except Exception as e:
         print(f"ONNX Export failed: {e}")
 
-    # Export teacher cache to output dir if it exists
     if cache_teachers:
         import shutil
         _wlm_tag = wavlm_model.replace("/", "_")

@@ -2,9 +2,9 @@ import torch
 import torch.nn.functional as F
 import numpy as np
 
-def truncation_margin_loss(embed_full, embed_truncated, margin=0.8):
-    diff = embed_full - embed_truncated
-    dist = torch.sqrt(torch.sum(diff ** 2, dim=-1) + 1e-8)
+def truncation_margin_loss(embed_full, embed_truncated, margin=0.32):
+    cos_sim = (embed_full * embed_truncated).sum(dim=-1)
+    dist = 1.0 - cos_sim
     return F.relu(margin - dist).mean()
 
 def cosine_distillation_loss(student_proj, teacher_embed):

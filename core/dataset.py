@@ -54,6 +54,31 @@ class MSWCTrainingDataset(Dataset):
         self.mel_transform = T.MelSpectrogram(
             sample_rate=SR, n_fft=N_FFT, hop_length=HOP_LENGTH, n_mels=N_MELS, power=2.0
         )
+        self.freq_mask = T.FrequencyMasking(freq_mask_param=12)
+        self.time_mask = T.TimeMasking(time_mask_param=10)
+        
+        self.hey_clips = []
+        hey_dir = "./hey_clips"
+        if not os.path.exists(hey_dir) or not glob.glob(os.path.join(hey_dir, "*.wav")):
+            print("📣 'hey_clips' directory missing or empty. Auto-generating synthetic phrase clips...")
+            try:
+                import subprocess
+                subprocess.run([sys.executable, "scripts/generate_hey_clips.py", "--output_dir", hey_dir, "--count", "120"], check=False)
+            except Exception as e:
+                print(f"⚠️ Could not auto-generate hey clips: {e}")
+
+        if os.path.exists(hey_dir):
+            wav_files = glob.glob(os.path.join(hey_dir, "*.wav"))
+            for p in wav_files:
+                try:
+                    w, in_sr = torchaudio.load(p)
+                    if w.shape[0] > 1:
+                        w = w.mean(dim=0, keepdim=True)
+                    if in_sr != SR:
+                        w = torchaudio.functional.resample(w, in_sr, SR)
+                    self.hey_clips.append(w.squeeze(0).numpy())
+                except Exception:
+                    pass
 
     def __len__(self):
         return len(self.dataset)
@@ -66,12 +91,9 @@ class MSWCTrainingDataset(Dataset):
         word = item.get("keyword") or item.get("word")
         if not word and "label" in item:
             val = item["label"]
-            
-            # Unpack Subset to reach HF dataset features if necessary
             base_ds = self.dataset
             while hasattr(base_ds, "dataset"):
                 base_ds = base_ds.dataset
-                
             if isinstance(val, str):
                 word = val
             elif hasattr(base_ds, "features") and "label" in base_ds.features:
@@ -92,6 +114,10 @@ class MSWCTrainingDataset(Dataset):
             rate = random.choice(TEMPO_AUG_FACTORS)
             wav = time_stretch_audio(wav, rate, SR)
 
+        if self.hey_clips and random.random() < 0.35:
+            hey = random.choice(self.hey_clips)
+            wav = np.concatenate([hey, wav])
+
         if self.noise_clips and random.random() < 0.6:
             noise = random.choice(self.noise_clips)
             if len(noise) > len(wav):
@@ -106,6 +132,10 @@ class MSWCTrainingDataset(Dataset):
             scale = np.sqrt(sig_power / (noise_power * (10**(snr / 10.0))))
             wav = wav + noise_seg * scale
 
+        if random.random() < 0.5:
+            gain_db = random.uniform(-6.0, 6.0)
+            wav = wav * (10 ** (gain_db / 20.0))
+
         wav = pad_or_trim(wav, self.target_samples)
         trunc_wav = create_truncated_clip(wav, SR)
         trunc_wav = pad_or_trim(trunc_wav, self.target_samples)
@@ -118,21 +148,34 @@ class MSWCTrainingDataset(Dataset):
 
         log_mel = torch.log(torch.clamp(mel, min=1e-5))
         trunc_log_mel = torch.log(torch.clamp(trunc_mel, min=1e-5))
+
+        # Per-utterance CMVN
+        log_mel = (log_mel - log_mel.mean(dim=-1, keepdim=True)) / (log_mel.std(dim=-1, keepdim=True) + 1e-5)
+        trunc_log_mel = (trunc_log_mel - trunc_log_mel.mean(dim=-1, keepdim=True)) / (trunc_log_mel.std(dim=-1, keepdim=True) + 1e-5)
+
+        # SpecAugment
+        if random.random() < 0.5:
+            log_mel = self.freq_mask(log_mel)
+            trunc_log_mel = self.freq_mask(trunc_log_mel)
+        if random.random() < 0.5:
+            log_mel = self.freq_mask(log_mel)
+            trunc_log_mel = self.freq_mask(trunc_log_mel)
+        if random.random() < 0.5:
+            log_mel = self.time_mask(log_mel)
+            trunc_log_mel = self.time_mask(trunc_log_mel)
+
         phoneme_tokens = word_to_phoneme_tokens(word)
 
+        actual_idx = self.indices[idx] if self.indices is not None else idx
         res = {
             "wav": wav,
             "mel": log_mel,
             "trunc_mel": trunc_log_mel,
             "word": word,
-            "phoneme_tokens": torch.tensor(phoneme_tokens, dtype=torch.long)
+            "phoneme_tokens": torch.tensor(phoneme_tokens, dtype=torch.long),
+            "sample_idx": actual_idx
         }
         
-        if self.teacher_targets is not None:
-            actual_idx = self.indices[idx] if self.indices is not None else idx
-            res["wavlm_target"] = self.teacher_targets["wavlm"][actual_idx]
-            res["whisper_target"] = self.teacher_targets["whisper"][actual_idx]
-            
         return res
 
 def collate_fn(batch):
@@ -143,6 +186,7 @@ def collate_fn(batch):
     tokens = [b["phoneme_tokens"] for b in batch]
     target_lengths = torch.tensor([len(t) for t in tokens], dtype=torch.long)
     targets = torch.cat(tokens, dim=0)
+    sample_idxs = torch.tensor([b["sample_idx"] for b in batch], dtype=torch.long)
     
     res = {
         "mels": mels,
@@ -150,13 +194,10 @@ def collate_fn(batch):
         "wavs": wavs,
         "words": words,
         "targets": targets,
-        "target_lengths": target_lengths
+        "target_lengths": target_lengths,
+        "sample_idxs": sample_idxs
     }
     
-    if "wavlm_target" in batch[0]:
-        res["wavlm_targets"] = torch.stack([b["wavlm_target"] for b in batch], dim=0)
-        res["whisper_targets"] = torch.stack([b["whisper_target"] for b in batch], dim=0)
-        
     return res
 
 def get_dataloaders(batch_size=BATCH_SIZE, num_workers=4):

@@ -1,11 +1,3 @@
-"""
-Real-Time Continuous Live Microphone Stream for Wake Word Engine
-===============================================================
-- Enrolls custom wake phrase with 3 quick voice recordings (saves to profile.json)
-- Runs a non-stop continuous live mic stream
-- Displays live probability meters and instant trigger notifications in the terminal
-"""
-
 import os
 import sys
 import os
@@ -16,6 +8,7 @@ import json
 import numpy as np
 import torch
 import torchaudio.transforms as T
+import hashlib
 
 try:
     import sounddevice as sd
@@ -31,11 +24,30 @@ except ImportError:
     print("   pip install onnxruntime\n")
 
 from core.config import SR, N_MELS, N_FFT, HOP_LENGTH, EMBED_DIM, STAGE2_GLOBAL_THRESHOLD, SUFFIX_REJECTION_THRESHOLD
-from core.audio_utils import endpoint_utterance, time_stretch_audio, generate_phonetic_minimal_pairs
+from core.audio_utils import endpoint_utterance, time_stretch_audio, generate_phonetic_minimal_pairs, word_to_phoneme_tokens
 from core.inference import WakeWordCascade
 
 PROFILE_PATH = "wakeword_profile.json"
 DEFAULT_MODEL_PATH = "wakeword_student.onnx"
+
+def get_file_md5(fname):
+    if not os.path.exists(fname): return ""
+    hash_md5 = hashlib.md5()
+    with open(fname, "rb") as f:
+        for chunk in iter(lambda: f.read(4096), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+def compute_ctc_posterior(ctc_logits, target_tokens):
+    if not target_tokens:
+        return 1.0
+    probs = np.exp(ctc_logits[0]) # [T, 42]
+    token_probs = []
+    for token in target_tokens:
+        if token != 41: # ignore <UNK>
+            token_probs.append(np.max(probs[:, token]))
+    if not token_probs: return 1.0
+    return float(np.mean(token_probs))
 
 class LiveWakeWordEngine:
     def __init__(self, model_path=DEFAULT_MODEL_PATH, phrase="Hey Karthika", debug=False):
@@ -43,6 +55,7 @@ class LiveWakeWordEngine:
         self.phrase = phrase
         self.debug = debug
         self.sr = SR
+        self.model_hash = get_file_md5(model_path)
         self.cascade = WakeWordCascade(
             stage1_path="", 
             stage2_path=model_path if os.path.exists(model_path) else "",
@@ -53,6 +66,8 @@ class LiveWakeWordEngine:
         self.mel_transform = T.MelSpectrogram(
             sample_rate=SR, n_fft=N_FFT, hop_length=HOP_LENGTH, n_mels=N_MELS, power=2.0
         )
+        words = phrase.split()
+        self.target_tokens = word_to_phoneme_tokens(words[-1])
         
     def record_clip(self, duration_sec=1.5, prompt="Say wake word"):
         print(f"\n🎤 {prompt}... (Listening for {duration_sec}s)")
@@ -63,7 +78,6 @@ class LiveWakeWordEngine:
         return wav
 
     def enroll_interactive(self, num_clips=3):
-        """Interactively records 3 user voice samples to establish the acoustic profile."""
         print(f"\n=======================================================")
         print(f"🎙️  ENROLLMENT: Setting up Wake Word '{self.phrase}'")
         print(f"=======================================================")
@@ -71,23 +85,24 @@ class LiveWakeWordEngine:
         
         clips = []
         for i in range(num_clips):
-            input(f"\nPress [ENTER] to record sample {i+1}/{num_clips}...")
-            wav = self.record_clip(duration_sec=1.5, prompt=f"Sample {i+1}: Say '{self.phrase}'")
-            # Endpoint to clean boundaries
-            clean_wav = endpoint_utterance(wav, self.sr)
-            if clean_wav is not None:
-                clips.append(clean_wav)
-            else:
-                clips.append(wav)
+            while True:
+                input(f"\nPress [ENTER] to record sample {i+1}/{num_clips}...")
+                wav = self.record_clip(duration_sec=1.5, prompt=f"Sample {i+1}: Say '{self.phrase}'")
+                clean_wav = endpoint_utterance(wav, self.sr)
+                if clean_wav is not None:
+                    clips.append(clean_wav)
+                    break
+                else:
+                    print("⚠️  Could not detect speech in that recording. Please speak louder and retry.")
                 
         print("\n⏳ Processing multi-tempo variations & minimal pairs...")
         self.cascade.enroll(clips, phrase=self.phrase, sr=self.sr)
         
-        # Save profile locally so enrollment is only done once
         profile_data = {
             "phrase": self.phrase,
+            "model_hash": self.model_hash,
             "global_target_profile": self.cascade.global_target_profile.tolist(),
-            "segment_target_profiles": self.cascade.segment_target_profiles.tolist(),
+            "suffix_target_profile": self.cascade.suffix_target_profile.tolist(),
             "mean_duration": self.cascade.mean_duration,
             "std_duration": self.cascade.std_duration,
             "minimal_pairs": self.cascade.minimal_pair_negatives
@@ -102,9 +117,14 @@ class LiveWakeWordEngine:
             return False
         with open(PROFILE_PATH, "r") as f:
             data = json.load(f)
+            
+        if data.get("model_hash") != self.model_hash:
+            print("⚠️  Model version changed since last enrollment. Re-enrolling is required.")
+            return False
+            
         self.phrase = data.get("phrase", self.phrase)
         self.cascade.global_target_profile = np.array(data["global_target_profile"], dtype=np.float32)
-        self.cascade.segment_target_profiles = np.array(data["segment_target_profiles"], dtype=np.float32)
+        self.cascade.suffix_target_profile = np.array(data["suffix_target_profile"], dtype=np.float32)
         self.cascade.mean_duration = data["mean_duration"]
         self.cascade.std_duration = data["std_duration"]
         self.cascade.minimal_pair_negatives = data.get("minimal_pairs", [])
@@ -112,7 +132,6 @@ class LiveWakeWordEngine:
         return True
 
     def run_live_stream(self):
-        """Non-stop continuous streaming loop displaying live probability meter."""
         if not self.load_profile():
             self.enroll_interactive(num_clips=3)
 
@@ -121,71 +140,88 @@ class LiveWakeWordEngine:
         print(f"=======================================================")
         print("Press Ctrl+C to stop listening.\n")
 
-        # Sliding window buffer: 1.2 seconds of audio with 0.1s hop
-        buffer_len = int(1.2 * self.sr)
+        buffer_len = int(1.5 * self.sr)
         hop_len = int(0.15 * self.sr)
         audio_buffer = np.zeros(buffer_len, dtype=np.float32)
+        
+        session = self.cascade.stage2
+        input_name = session.get_inputs()[0].name if session else ""
+        outputs = session.get_outputs() if session else []
+        has_ctc = any(o.name == 'ctc_logits' for o in outputs)
 
         try:
             with sd.InputStream(samplerate=self.sr, channels=1, dtype='float32', blocksize=hop_len) as stream:
                 last_trigger_time = 0.0
                 
                 while True:
-                    # Read new audio hop
                     chunk, _ = stream.read(hop_len)
                     chunk = chunk.squeeze()
                     
-                    # Slide buffer
                     audio_buffer = np.roll(audio_buffer, -hop_len)
                     audio_buffer[-hop_len:] = chunk
                     
-                    # Quick RMS energy check
                     rms = np.sqrt(np.mean(audio_buffer**2) + 1e-10)
                     db = 20 * np.log10(rms)
                     
                     if db < -45.0:
-                        # Ambient silence
                         bar = "░" * 20
                         sys.stdout.write(f"\r[ {bar} ]  0.0%  (Ambient Silence: {db:.1f} dB)    ")
                         sys.stdout.flush()
                         continue
 
-                    # Extract Log-Mel Spectrogram
-                    wav_t = torch.tensor(audio_buffer, dtype=torch.float32).unsqueeze(0)
+                    current_time = time.time()
+                    if current_time - last_trigger_time < 2.0:
+                        audio_buffer.fill(0) # Flush buffer after trigger
+                        continue
+
+                    # Endpoint to match enrollment conditions
+                    clean_wav = endpoint_utterance(audio_buffer, self.sr)
+                    if clean_wav is None:
+                        continue # wait for a clean endpointed utterance
+                        
+                    wav_t = torch.tensor(clean_wav, dtype=torch.float32).unsqueeze(0)
                     mel = self.mel_transform(wav_t)
                     log_mel = torch.log(torch.clamp(mel, min=1e-5))
-                    feat = log_mel.transpose(1, 2).unsqueeze(0).numpy() # (1, 1, time, n_mels)
+                    # CMVN
+                    log_mel = (log_mel - log_mel.mean(dim=-1, keepdim=True)) / (log_mel.std(dim=-1, keepdim=True) + 1e-5)
+                    feat = log_mel.transpose(1, 2).unsqueeze(0).numpy()
                     
-                    # Run Verification — pass raw buffer so cascade can VAD-measure real speech duration
+                    ctc_suffix_prob = 1.0
+                    if session and has_ctc:
+                        outs = session.run(None, {input_name: feat})
+                        # Typically embedding, suffix_embed, ctc_logits
+                        # Find ctc_logits by matching name
+                        ctc_idx = next(i for i, o in enumerate(outputs) if o.name == 'ctc_logits')
+                        ctc_logits = outs[ctc_idx]
+                        ctc_suffix_prob = compute_ctc_posterior(ctc_logits, self.target_tokens[-3:])
+                    
                     triggered, metrics = self.cascade.verify_utterance(
-                        feat, duration_sec=1.2,
-                        audio_buffer=audio_buffer, sr=self.sr,
-                        ctc_suffix_prob=0.90
+                        feat, duration_sec=len(clean_wav)/self.sr,
+                        audio_buffer=None, # Already endpointed, so passed duration is exact
+                        sr=self.sr,
+                        ctc_suffix_prob=ctc_suffix_prob
                     )
                     
                     similarity = metrics.get("stage2_global_similarity", 0.0)
                     suffix_sim = metrics.get("suffix_phase_similarity", 0.0)
                     
-                    # Calibrate probability based on dynamic range (baseline floor ~0.85, target ~0.98)
-                    # Maps 0.80 -> 0%, 0.98 -> 100%
                     prob = max(0.0, min(100.0, ((similarity - 0.80) / 0.18) * 100.0))
                     
-                    # Visual Progress Bar
                     filled = int(prob / 5)
                     bar = "█" * filled + "░" * (20 - filled)
                     
-                    current_time = time.time()
-                    if triggered and (current_time - last_trigger_time > 2.0):
+                    if triggered:
                         last_trigger_time = current_time
                         sys.stdout.write(f"\r\n\n🚨 [{bar}] {prob:.1f}% -> WAKE WORD DETECTED: '{self.phrase}'! 🚀\n   [Telemetry: CosSim={similarity:.4f} (Thresh={self.cascade.threshold2}), SuffixSim={suffix_sim:.4f}, Energy={db:.1f} dB]\n\n")
                         sys.stdout.flush()
+                        audio_buffer.fill(0)
                     else:
                         status = "Listening..." if prob < 60 else "Matching..."
                         if metrics.get("near_miss"):
                             status = f"⚡ Near-miss ({metrics.get('near_miss_stage', '?')})"
                         if "rejection_reason" in metrics:
                             status = metrics["rejection_reason"]
-                        dur_str = f"{metrics.get('duration_sec_measured', metrics.get('duration_sec', 0.0)):.2f}s"
+                        dur_str = f"{metrics.get('duration_sec', 0.0):.2f}s"
                         
                         log_str = f"[ {bar} ] {prob:5.1f}% | Sim: {similarity:.4f} | Suf: {suffix_sim:.4f} | dB: {db:5.1f} | Dur: {dur_str} | ({status})"
                         if hasattr(self, 'debug') and self.debug:

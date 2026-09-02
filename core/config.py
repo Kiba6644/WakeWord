@@ -3,12 +3,12 @@ import torch
 
 # Audio Frontend
 SR = 16000
-N_MELS = 40
+N_MELS = 80
 N_FFT = 400
 HOP_LENGTH = 160
 
 # Model Architecture
-EMBED_DIM = 128
+EMBED_DIM = 256
 STAGE1_TEMPORAL_HEAD = "pool"
 STAGE2_TEMPORAL_HEAD = "attention"
 STAGE1_CHANNELS = (16, 32, 32, 64)
@@ -17,7 +17,7 @@ NUM_ATTENTION_HEADS = 4
 
 # SOTA Phoneme CTC Head
 NUM_PHONEMES = 42                              # 39 phonemes + blank + silence + unk
-CTC_LOSS_WEIGHT = 0.3                          # Balanced with distillation
+CTC_LOSS_WEIGHT = 0.2                          # Cleaned up with better G2P, reduced weight
 
 # Endpointing
 MAX_CLIP_SEC = 1.8
@@ -35,7 +35,7 @@ WAVLM_DISTILL_WEIGHT = 0.1  # Massively dropped to prevent speaker overfitting (
 
 WHISPER_TEACHER_MODEL = "openai/whisper-base"  # 512D Noise/Ambient specialist
 WHISPER_EMBED_DIM = 512
-WHISPER_DISTILL_WEIGHT = 0.3
+WHISPER_DISTILL_WEIGHT = 1.0  # Raised to 1.0 to prioritize phonetic content
 USE_DUAL_DISTILLATION = True
 
 # Tempo & Generative Minimal-Pair Factory
@@ -44,12 +44,14 @@ MINIMAL_PAIR_NEGATIVE_COUNT = 12
 
 # Verification Thresholds (Stage 2)
 NUM_TEMPORAL_SEGMENTS = 3
+SUFFIX_SPLIT = 0.55                        # Start of suffix region (last 45% of frames)
+SUFFIX_SUPCON_WEIGHT = 1.5                 # Suffix SupCon loss weight
 STAGE1_THRESHOLD = 0.60
 STAGE2_GLOBAL_THRESHOLD = 0.82
-SUFFIX_REJECTION_THRESHOLD = 0.62          # Relaxed from 0.65 — reduces false rejects on fast speech
+SUFFIX_REJECTION_THRESHOLD = 0.82          # Strict suffix match gate
 CTC_POSTERIOR_THRESHOLD = 0.70
 # Duration gate — asymmetric: strict on short (catches truncations), lenient on long (allows slow speech)
-DURATION_GATE_STD_LOWER = 2.0              # Reject if duration < mean - 2.0*std  (tight — catches "Hey Karthik")
+DURATION_GATE_STD_LOWER = 1.2              # Reject if duration < mean - 1.2*std
 DURATION_GATE_STD_UPPER = 3.5             # Allow if duration < mean + 3.5*std  (loose — allows slow speech)
 DURATION_GATE_STD = 2.5                   # Legacy fallback — kept for backward compat
 
@@ -60,8 +62,8 @@ MSWC_MIN_CLIPS_PER_KEYWORD = 30                # Filters out noisy/rare words
 PHONETIC_HARD_NEGATIVE_RATIO = 0.6
 
 # Training & Optimization Parameters
-# Defaulting to 128 to be safe across environments (T4s have 16GB). Adjust downward if OOM on <= 4GB GPUs.
-BATCH_SIZE = 128
+# Defaulting to 32 to safely fit 4GB VRAM GPUs (e.g. GTX 1650, RTX 3050 4GB).
+BATCH_SIZE = 32
 
 NUM_WORKERS = 4
 LEARNING_RATE = 5e-4                           # Optimal initial LR for AdamW + Distillation

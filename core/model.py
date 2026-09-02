@@ -2,7 +2,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .config import (EMBED_DIM, STAGE2_CHANNELS, NUM_ATTENTION_HEADS, 
-                    WAVLM_EMBED_DIM, WHISPER_EMBED_DIM, NUM_PHONEMES)
+                    WAVLM_EMBED_DIM, WHISPER_EMBED_DIM, NUM_PHONEMES, SUFFIX_SPLIT)
+
+class SinusoidalPositionalEncoding(nn.Module):
+    def forward(self, x):  # x: [B, T, C]
+        T, C = x.shape[1], x.shape[2]
+        pos = torch.arange(T, device=x.device).unsqueeze(1)
+        dim = torch.arange(0, C, 2, device=x.device).float()
+        pe = torch.zeros(T, C, device=x.device)
+        pe[:, 0::2] = torch.sin(pos / (10000 ** (dim / C)))
+        pe[:, 1::2] = torch.cos(pos / (10000 ** (dim / C)))
+        return x + pe.unsqueeze(0)
 
 class SqueezeExcitation(nn.Module):
     def __init__(self, channels, reduction=4):
@@ -11,7 +21,7 @@ class SqueezeExcitation(nn.Module):
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
             nn.Linear(channels, channels // reduction, bias=False),
-            nn.SiLU(inplace=True),
+            nn.SiLU(inplace=False),
             nn.Linear(channels // reduction, channels, bias=False),
             nn.Sigmoid()
         )
@@ -28,16 +38,24 @@ class DepthwiseSeparableConv(nn.Module):
                                    stride=stride, padding=padding, groups=in_ch, bias=False)
         self.pointwise = nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=False)
         self.bn = nn.BatchNorm2d(out_ch)
-        self.silu = nn.SiLU(inplace=True)
+        self.silu = nn.SiLU(inplace=False)
         self.se = SqueezeExcitation(out_ch)
+        
+        self.shortcut = nn.Identity()
+        if stride != 1 or in_ch != out_ch:
+            self.shortcut = nn.Sequential(
+                nn.Conv2d(in_ch, out_ch, kernel_size=1, stride=stride, bias=False),
+                nn.BatchNorm2d(out_ch)
+            )
 
     def forward(self, x):
+        res = self.shortcut(x)
         x = self.depthwise(x)
         x = self.pointwise(x)
         x = self.bn(x)
         x = self.silu(x)
         x = self.se(x)
-        return x
+        return x + res
 
 class DSCNNEncoder(nn.Module):
     def __init__(self, in_channels=1, channels=(32, 64, 64, 128)):
@@ -98,10 +116,15 @@ class WakeWordModel(nn.Module):
     def __init__(self, channels=STAGE2_CHANNELS, temporal_head="attention", embed_dim=EMBED_DIM):
         super().__init__()
         self.encoder = DSCNNEncoder(in_channels=1, channels=channels)
+        self.pos_encoder = SinusoidalPositionalEncoding()
+        encoder_layer = nn.TransformerEncoderLayer(d_model=channels[-1], nhead=4, dim_feedforward=256, batch_first=True)
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=2)
+        
         self.temporal_head_type = temporal_head
         
         if temporal_head == "attention":
-            self.temporal = MultiHeadAttentionPooling(channels[-1], embed_dim)
+            self.global_pool = MultiHeadAttentionPooling(channels[-1], embed_dim)
+            self.suffix_pool = MultiHeadAttentionPooling(channels[-1], embed_dim)
         elif temporal_head == "gru":
             self.gru = nn.GRU(channels[-1], embed_dim, batch_first=True)
         else:
@@ -109,12 +132,12 @@ class WakeWordModel(nn.Module):
             self.fc = nn.Linear(channels[-1], embed_dim)
 
         self.distill_wavlm_proj = nn.Sequential(
-            nn.Linear(embed_dim, 512, bias=False),
+            nn.Linear(channels[-1], 512, bias=False),
             nn.SiLU(inplace=True),
             nn.Linear(512, WAVLM_EMBED_DIM, bias=False)
         )
         self.distill_whisper_proj = nn.Sequential(
-            nn.Linear(embed_dim, 256, bias=False),
+            nn.Linear(channels[-1], 256, bias=False),
             nn.SiLU(inplace=True),
             nn.Linear(256, WHISPER_EMBED_DIM, bias=False)
         )
@@ -129,11 +152,13 @@ class WakeWordModel(nn.Module):
         if x.ndim == 3:
             x = x.unsqueeze(1)
         feat = self.encoder(x)
-        feat = feat.mean(dim=-1)
+        feat = feat.mean(dim=-2)
         feat = feat.transpose(1, 2)
+        feat = self.pos_encoder(feat)
+        feat = self.transformer(feat)
         return feat
 
-    def forward(self, x, mask=None, return_distill=False, return_ctc=False):
+    def forward(self, x, mask=None, return_distill=False, return_ctc=False, return_suffix=False):
         feat = self.extract_time_features(x)
         
         if self.temporal_head_type == "attention":
@@ -143,30 +168,51 @@ class WakeWordModel(nn.Module):
                 bool_mask = mask_down > 0.5
             else:
                 bool_mask = None
-            embed = self.temporal(feat, mask=bool_mask)
+                
+            global_out = self.global_pool(feat, mask=bool_mask)
+            
+            T = feat.shape[1]
+            suffix_start = int(T * SUFFIX_SPLIT)
+            suffix_feat = feat[:, suffix_start:, :]
+            suffix_mask = bool_mask[:, suffix_start:] if bool_mask is not None else None
+            suffix_out = self.suffix_pool(suffix_feat, mask=suffix_mask)
+            
+            global_embed = F.normalize(global_out, p=2, dim=-1)
+            suffix_embed = F.normalize(suffix_out, p=2, dim=-1)
         elif self.temporal_head_type == "gru":
             out, _ = self.gru(feat)
-            embed = out[:, -1, :]
+            global_embed = F.normalize(out[:, -1, :], p=2, dim=-1)
+            suffix_embed = global_embed
         else:
             pooled = self.pool(feat.transpose(1, 2)).squeeze(-1)
-            embed = self.fc(pooled)
+            global_embed = F.normalize(self.fc(pooled), p=2, dim=-1)
+            suffix_embed = global_embed
             
-        norm_embed = F.normalize(embed, p=2, dim=-1)
-        ctc_logits = self.ctc_head(feat) if (return_ctc or return_distill) else None
+        ctc_logits = self.ctc_head(feat) if (return_ctc or return_distill or return_suffix) else None
         
+        res = []
         if return_distill:
-            # Decouple distillation from the final embedding. 
-            # Distillation teaches the encoder (feat) general acoustics, 
-            # while SupCon teaches the temporal head (norm_embed) strict word clustering.
             pooled_feat = feat.mean(dim=1)
             wavlm_proj = self.distill_wavlm_proj(pooled_feat)
             whisper_proj = self.distill_whisper_proj(pooled_feat)
-            return norm_embed, (wavlm_proj, whisper_proj), ctc_logits
+            if return_suffix:
+                return global_embed, suffix_embed, (wavlm_proj, whisper_proj), ctc_logits
+            return global_embed, (wavlm_proj, whisper_proj), ctc_logits
+            
+        if return_suffix:
+            if return_ctc:
+                return global_embed, suffix_embed, ctc_logits
+            return global_embed, suffix_embed
             
         if return_ctc:
-            return norm_embed, ctc_logits
+            return global_embed, ctc_logits
             
-        return norm_embed
+        # Standard ONNX export mode: returns global_embed, ctc_logits
+        # We need a stable output signature for ONNX that includes CTC.
+        # If this is called without special flags but is tracing, we might want ctc_logits.
+        # To avoid breaking existing things, default just returns global_embed,
+        # but the ONNX export script will use return_ctc=True explicitly.
+        return global_embed
 
     def forward_segments(self, x, num_segments=3):
         feat = self.extract_time_features(x)
@@ -180,7 +226,7 @@ class WakeWordModel(nn.Module):
             seg_feat = feat[:, start:end, :]
             
             if self.temporal_head_type == "attention":
-                seg_out = self.temporal(seg_feat)
+                seg_out = self.global_pool(seg_feat)
             elif self.temporal_head_type == "gru":
                 _, h = self.gru(seg_feat)
                 seg_out = h.squeeze(0)
