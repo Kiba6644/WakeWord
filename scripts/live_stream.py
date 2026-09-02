@@ -50,18 +50,20 @@ def compute_ctc_posterior(ctc_logits, target_tokens):
     return float(np.mean(token_probs))
 
 class LiveWakeWordEngine:
-    def __init__(self, model_path=DEFAULT_MODEL_PATH, phrase="Hey Karthika", debug=False):
+    def __init__(self, model_path=DEFAULT_MODEL_PATH, phrase="Hey Karthika", debug=False, threshold=None, suffix_threshold=None):
         self.model_path = model_path
         self.phrase = phrase
         self.debug = debug
         self.sr = SR
         self.model_hash = get_file_md5(model_path)
+        g_thresh = threshold if threshold is not None else STAGE2_GLOBAL_THRESHOLD
+        s_thresh = suffix_threshold if suffix_threshold is not None else SUFFIX_REJECTION_THRESHOLD
         self.cascade = WakeWordCascade(
             stage1_path="", 
             stage2_path=model_path if os.path.exists(model_path) else "",
             threshold1=0.55, 
-            threshold2=STAGE2_GLOBAL_THRESHOLD, 
-            suffix_threshold=SUFFIX_REJECTION_THRESHOLD
+            threshold2=g_thresh, 
+            suffix_threshold=s_thresh
         )
         self.mel_transform = T.MelSpectrogram(
             sample_rate=SR, n_fft=N_FFT, hop_length=HOP_LENGTH, n_mels=N_MELS, power=2.0
@@ -234,13 +236,30 @@ class LiveWakeWordEngine:
             print("\n\n🛑 Live streaming stopped by user.")
 
 if __name__ == "__main__":
-    debug_mode = "--debug" in sys.argv
-    args = [arg for arg in sys.argv[1:] if arg != "--debug"]
+    import argparse
+    parser = argparse.ArgumentParser(description="Live Wake Word Stream Verification")
+    parser.add_argument("phrase", type=str, nargs="?", default="Hey Karthika", help="Target wake word phrase (default: 'Hey Karthika')")
+    parser.add_argument("--threshold", "-t", type=float, default=None, help="Global cosine similarity threshold (e.g. 0.85)")
+    parser.add_argument("--suffix_threshold", "-st", type=float, default=None, help="Suffix embedding rejection threshold (e.g. 0.82)")
+    parser.add_argument("--model_path", "-m", type=str, default=DEFAULT_MODEL_PATH, help="Path to exported ONNX model")
+    parser.add_argument("--debug", action="store_true", help="Print verbose step-by-step telemetry")
+    parser.add_argument("--re_enroll", action="store_true", help="Force new interactive voice enrollment")
     
-    wake_phrase = args[0] if len(args) > 0 else "Hey Karthika"
-    thresh = float(args[1]) if len(args) > 1 else 0.96
+    args = parser.parse_args()
     
-    engine = LiveWakeWordEngine(phrase=wake_phrase, debug=debug_mode)
-    engine.cascade.threshold2 = thresh
-    print(f"🔧 Configured Detection Threshold: {thresh} | Debug: {debug_mode}")
+    if args.re_enroll and os.path.exists(PROFILE_PATH):
+        os.remove(PROFILE_PATH)
+        print("🗑️ Removed existing profile for fresh re-enrollment.")
+
+    engine = LiveWakeWordEngine(
+        model_path=args.model_path,
+        phrase=args.phrase,
+        debug=args.debug,
+        threshold=args.threshold,
+        suffix_threshold=args.suffix_threshold
+    )
+    
+    g_thresh = engine.cascade.threshold2
+    s_thresh = engine.cascade.suffix_threshold
+    print(f"🔧 Live Stream Configured | Phrase: '{args.phrase}' | Global Threshold: {g_thresh} | Suffix Threshold: {s_thresh} | Debug: {args.debug}")
     engine.run_live_stream()

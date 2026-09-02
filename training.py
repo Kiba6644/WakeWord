@@ -322,7 +322,7 @@ def run_training(
     train_loader = DataLoader(
         train_dataset,
         batch_sampler=train_sampler,
-        collate_fn=collate_fn, num_workers=4, pin_memory=True
+        collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True
     )
     val_dataset = MSWCTrainingDataset(val_ds, noise_clips=noise_bank, teacher_targets=teacher_targets, indices=val_ds.indices if teacher_targets else None)
     val_sampler = WordBalancedBatchSampler(val_dataset, batch_size=batch_size, samples_per_word=4)
@@ -330,7 +330,7 @@ def run_training(
     val_loader = DataLoader(
         val_dataset,
         batch_sampler=val_sampler,
-        collate_fn=collate_fn, num_workers=4, pin_memory=True
+        collate_fn=collate_fn, num_workers=4, pin_memory=True, persistent_workers=True
     )
     
     student = WakeWordModel().to(device)
